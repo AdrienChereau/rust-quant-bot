@@ -41,6 +41,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let pm = Arc::new(Mutex::new(PmShared::default()));
     spawn_pm_task(pm.clone());
 
+    let lat = crate::latency::shared();
+    {
+        let l = lat.clone();
+        tokio::spawn(async move { crate::latency::run(l, crate::latency::Probes::PmOnly).await; });
+    }
+
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash,
         KellyParams {
@@ -105,6 +111,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         }
 
         // Dashboard exécuteur (PM/position/PnL ; OBI laissé à 0).
+        let lat_snap = lat.lock().unwrap().clone();
         {
             let mut d = dash.write().await;
             d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
@@ -119,6 +126,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.realized_pnl = paper.state.realized_pnl; d.drawdown = paper.drawdown();
             d.shots = paper.state.shots; d.wins = paper.state.wins; d.losses = paper.state.losses;
             d.hit_rate = paper.hit_rate();
+            d.lat_polymarket_ms = lat_snap.polymarket_ms;
         }
 
         log_throttle += 1;
