@@ -397,7 +397,7 @@ mod tests {
             feeRateBps: U256::from(f.fee_rate_bps), side: f.side, signatureType: f.signature_type,
         };
         let domain = eip712_domain! { name: "Polymarket CTF Exchange", version: "1",
-            chain_id: CHAIN_ID, verifying_contract: EXCHANGE_CTF.parse::<Address>().unwrap() };
+            chain_id: CHAIN_ID, verifying_contract: EXCHANGE_CTF.parse::<Address>().unwrap(), };
         let hash = order.eip712_signing_hash(&domain);
 
         let signer: PrivateKeySigner = c.private_key.parse().unwrap();
