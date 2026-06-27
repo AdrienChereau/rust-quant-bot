@@ -17,10 +17,11 @@ use crate::config::Config;
 use crate::dashboard;
 use crate::net::udp;
 use crate::net::wire::WireSignal;
-use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs};
+use crate::polymarket::live_executor::{self, LiveCredentials};
 use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
 use crate::state::RuntimeControls;
 use crate::strategy::bankroll::{self, KellyParams, PaperEngine};
+use crate::strategy::live_position::LivePositionManager;
 
 pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     tracing::info!(listen_port, dry_run = cfg.dry_run, "🎯 EXÉCUTEUR (Dublin) démarré");
@@ -73,14 +74,20 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         tokio::spawn(async move { crate::latency::run(l, crate::latency::Probes::PmOnly).await; });
     }
 
+    let kelly = KellyParams {
+        kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
+        tp_cents: cfg.take_profit_cents, sl_cents: cfg.stop_loss_cents, max_hold_secs: cfg.max_hold_secs,
+    };
     let mut paper = PaperEngine::load_or_init(
-        cfg.start_cash,
-        KellyParams {
-            kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
-            tp_cents: cfg.take_profit_cents, sl_cents: cfg.stop_loss_cents, max_hold_secs: cfg.max_hold_secs,
-        },
+        cfg.start_cash, kelly,
         std::env::var("STATE_PATH").unwrap_or_else(|_| "data/sniper_state.json".into()),
         std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
+    );
+    // Manager LIVE — symétrique au PaperEngine, mais touche le CLOB. Persistance séparée.
+    let mut live_mgr = LivePositionManager::load_or_init(
+        kelly,
+        std::env::var("LIVE_STATE_PATH").unwrap_or_else(|_| "data/live_state.json".into()),
+        std::env::var("LIVE_TRADES_PATH").unwrap_or_else(|_| "data/live_trades.jsonl".into()),
     );
 
     let mut rx = udp::listen(listen_port).await?;
@@ -109,12 +116,25 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             (g.market.clone(), g.real_up, g.up_book.clone(), g.down_book.clone(), g.remaining_s)
         };
 
-        // 1. Gestion de la position ouverte (TP/SL/max-hold).
+        // 1. Gestion de la position ouverte (TP/SL/max-hold) — paper.
         let mark_bid = if let Some(p) = &paper.position {
             let bk = if p.side == Side::Up { &up_book } else { &down_book };
             bk.best_bid()
         } else { None };
         paper.manage(mark_bid, now_ms, remaining_s);
+
+        // 1b. Gestion de la position LIVE (symétrique). Le manager poste les SELL FAK lui-même
+        //     si TP/SL/max-hold/fin-de-fenêtre est atteint ; reste idempotent sinon.
+        if let (Some(p), Some(creds), Some(m)) =
+            (live_mgr.position.as_ref(), live_creds.as_ref(), market.as_ref())
+        {
+            let live_book = if p.side == Side::Up { &up_book } else { &down_book };
+            let live_mark = live_book.best_bid();
+            live_mgr.manage(
+                creds, cfg.live_armed, live_mark, live_book,
+                m.min_order_size, m.tick_size, now_ms, remaining_s,
+            ).await;
+        }
 
         // Circuit breaker (drawdown) — LIVE : vraie bankroll CLOB ; PAPER : equity fictive.
         let breaker_hit = if controls.live_active() {
@@ -179,42 +199,45 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         let edge = gap; // gap ≥ gap_min > 0 ici
                         // Aiguillage live → paper.
                         if is_live {
-                            // Sizing sur la VRAIE collatéral CLOB. Tant qu'elle n'est pas lue, on
-                            // s'abstient (jamais sizer un ordre réel sur le cash paper fictif).
-                            match *live_bankroll.lock().unwrap() {
-                                None => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
-                                Some(bk) => {
-                                    let order_price = book.best_ask().unwrap_or(real_up);
-                                    // Sizing : Kelly normal, OU taille minimale forcée (micro-test).
-                                    let sized = if cfg.live_force_min_size {
-                                        Some(m.min_order_size)
-                                    } else {
-                                        bankroll::adjust_size_to_min(paper.kelly_size_for(edge, order_price, bk), m.min_order_size)
-                                    };
-                                    match sized {
-                                        None => tracing::info!(reason = "taille sous le minimum",
-                                            min = m.min_order_size, "✗ ordre live ignoré"),
-                                        Some(size) if size * order_price > bk => tracing::warn!(
-                                            cost = format!("{:.2}", size * order_price), bankroll = format!("{bk:.2}"),
-                                            "✗ ordre live ignoré — bankroll insuffisante"),
-                                        Some(size) => {
-                                            if cfg.live_force_min_size {
-                                                tracing::warn!(size, "⚠️ taille FORCÉE au minimum (LIVE_FORCE_MIN_SIZE)");
-                                            }
-                                            let args = OrderArgs { side, price: order_price, size };
-                                            match live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await {
-                                                Ok(live_executor::PlaceResult::Placed(id)) => {
-                                                    live_shots += 1;
-                                                    tracing::warn!(side = side.as_str(), order_id = %id,
-                                                        price = format!("{order_price:.3}"), size,
-                                                        "✅ ORDRE LIVE accepté");
+                            // En LIVE : on n'ouvre une position que si on a la vraie bankroll lue
+                            // ET qu'on n'a pas déjà une position live ouverte (LivePositionManager
+                            // l'enforce aussi, mais on évite un tir inutile).
+                            if live_mgr.position.is_some() {
+                                tracing::info!(reason = "position live déjà ouverte",
+                                    "✗ ordre live ignoré");
+                            } else {
+                                match (*live_bankroll.lock().unwrap(), live_creds.as_ref()) {
+                                    (None, _) => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
+                                    (_, None) => tracing::warn!("LIVE actif mais POLY_* credentials absents — tir ignoré"),
+                                    (Some(bk), Some(creds)) => {
+                                        let order_price = book.best_ask().unwrap_or(real_up);
+                                        // Sizing : Kelly normal, OU taille minimale forcée (micro-test).
+                                        // LivePositionManager rajoutera la garde notionnel ≥ $1.
+                                        let sized = if cfg.live_force_min_size {
+                                            Some(m.min_order_size)
+                                        } else {
+                                            bankroll::adjust_size_to_min(
+                                                paper.kelly_size_for(edge, order_price, bk),
+                                                m.min_order_size,
+                                            )
+                                        };
+                                        match sized {
+                                            None => tracing::info!(reason = "taille sous le minimum",
+                                                min = m.min_order_size, "✗ ordre live ignoré"),
+                                            Some(size) if size * order_price > bk => tracing::warn!(
+                                                cost = format!("{:.2}", size * order_price), bankroll = format!("{bk:.2}"),
+                                                "✗ ordre live ignoré — bankroll insuffisante"),
+                                            Some(size) => {
+                                                if cfg.live_force_min_size {
+                                                    tracing::warn!(size, "⚠️ taille FORCÉE au minimum (LIVE_FORCE_MIN_SIZE)");
                                                 }
-                                                Ok(live_executor::PlaceResult::DryRun) => tracing::warn!(
-                                                    side = side.as_str(), price = format!("{order_price:.3}"), size,
-                                                    "🔸 ordre live signé mais NON envoyé (LIVE_ARMED=false)"),
-                                                Err(e) => tracing::error!(error = %e, "❌ ordre live échoué"),
+                                                if live_mgr.try_open(
+                                                    creds, cfg.live_armed, side, token, m.neg_risk,
+                                                    order_price, size, m.tick_size, m.min_order_size, now_ms,
+                                                ).await {
+                                                    last_fire_ms = now_ms;
+                                                }
                                             }
-                                            last_fire_ms = now_ms;
                                         }
                                     }
                                 }
@@ -236,10 +259,17 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
             d.remaining_s = remaining_s;
             d.fair_up = last_fair; d.real_up = real_up; d.gap = last_fair - real_up;
-            d.in_position = paper.position.is_some();
-            if let Some(p) = &paper.position {
+            // Position affichée : la live prend la priorité si elle existe, sinon la paper.
+            if let Some(p) = &live_mgr.position {
+                d.in_position = true;
                 d.pos_side = p.side.as_str().into();
                 d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
+            } else if let Some(p) = &paper.position {
+                d.in_position = true;
+                d.pos_side = p.side.as_str().into();
+                d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
+            } else {
+                d.in_position = false;
             }
             d.cash = paper.state.cash; d.equity = paper.equity(mark_bid);
             d.realized_pnl = paper.state.realized_pnl; d.drawdown = paper.drawdown();
@@ -255,8 +285,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.max_drawdown = cfg.max_drawdown;
             d.lat_polymarket_ms = lat_snap.polymarket_ms;
             d.live_bankroll = *live_bankroll.lock().unwrap();
-            d.live_pnl = live_pnl_val;
-            d.live_shots = live_shots;
+            // PnL live : on PRIVILÉGIE le PnL réalisé par le manager (somme des clôtures réelles).
+            // Sinon fallback sur le Δ bankroll (live_pnl_val) — utile avant la 1re clôture.
+            d.live_pnl = if controls.live_active() {
+                if live_mgr.state.shots > 0 { Some(live_mgr.state.realized_pnl) } else { live_pnl_val }
+            } else { None };
+            d.live_shots = live_mgr.state.shots.max(live_shots);
             d.live_force_min = cfg.live_force_min_size;
         }
 

@@ -12,7 +12,6 @@ use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::{POLYGON};
 
 use super::live_executor::{LiveCredentials, OrderArgs, PlaceResult, CLOB_BASE};
-use crate::concurrency::bus::Side as BotSide;
 
 /// Dérive ou crée les credentials L2 CLOB (flow L1) — à lancer en local one-shot.
 pub async fn derive_api_creds(creds: &LiveCredentials) -> anyhow::Result<Credentials> {
@@ -48,9 +47,8 @@ pub async fn place_order_poly1271(
 
     let price = decimal_from_f64(args.price, price_dp, "price")?;
     let size = decimal_from_f64(args.size, 2, "size")?; // lot max 2 décimales (SDK)
-    let side = match args.side {
-        BotSide::Up | BotSide::Down => Side::Buy,
-    };
+    // `args.side` (Up/Down) sélectionne le **token** côté appelant ; ici on porte BUY/SELL.
+    let side = if args.is_sell { Side::Sell } else { Side::Buy };
 
     let signable = client
         .limit_order()
@@ -89,8 +87,24 @@ pub async fn place_order_poly1271(
     }
 
     let resp = client.post_order(signed).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    tracing::warn!(order_id = %resp.order_id, "✅ ordre LIVE POLY_1271 accepté");
-    Ok(PlaceResult::Placed(resp.order_id))
+    // Conversion Decimal → f64 (le SDK renvoie déjà en unités humaines, pas en base units).
+    use std::str::FromStr as _;
+    let to_f64 = |d: &polymarket_client_sdk_v2::types::Decimal|
+        f64::from_str(&d.to_string()).ok();
+    let making = to_f64(&resp.making_amount);
+    let taking = to_f64(&resp.taking_amount);
+    // BUY  : making = USDC dépensés, taking = shares reçus.
+    // SELL : making = shares donnés, taking = USDC reçus.
+    let (filled_size, avg_price) = match (making, taking) {
+        (Some(m), Some(t)) => {
+            let (shares, usdc) = if args.is_sell { (m, t) } else { (t, m) };
+            if shares > 0.0 { (Some(shares), Some(usdc / shares)) } else { (Some(0.0), None) }
+        }
+        _ => (None, None),
+    };
+    tracing::warn!(order_id = %resp.order_id, ?filled_size, ?avg_price,
+        "✅ ordre LIVE POLY_1271 accepté");
+    Ok(PlaceResult::Placed { order_id: resp.order_id, filled_size, avg_price })
 }
 
 async fn authenticated_client<S: Signer>(

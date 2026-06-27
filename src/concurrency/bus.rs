@@ -1,7 +1,7 @@
 //! Types partagés pour le bus de signaux (côté marché binaire).
 
 /// Côté du marché binaire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Up,
     Down,

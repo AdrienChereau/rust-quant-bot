@@ -142,20 +142,29 @@ fn trim_env(key: &str) -> Option<String> {
 }
 
 /// Paramètres d'un ordre à placer (côté stratégie).
+/// `side` désigne le **token** (Up/Down) ; le sens BUY/SELL est porté par `is_sell`.
+/// - BUY (entry) : on dépense `price * size` USDC pour recevoir `size` tokens du `side`.
+/// - SELL (exit) : on donne `size` tokens du `side` pour recevoir `price * size` USDC.
 #[derive(Debug, Clone, Copy)]
 pub struct OrderArgs {
     pub side: Side,
-    pub price: f64, // prix limite ∈ (0,1)
-    pub size: f64,  // nb de shares
+    pub price: f64,    // prix limite ∈ (0,1)
+    pub size: f64,     // nb de shares
+    pub is_sell: bool, // false = BUY (entry), true = SELL (exit)
 }
 
-/// Résultat d'une tentative de placement.
+/// Résultat d'une tentative de placement. Pour un fill réel, on renvoie aussi la taille fillée
+/// et le prix moyen quand le CLOB les expose (sinon `None` → l'appelant doit fallback).
 #[derive(Debug, PartialEq)]
 pub enum PlaceResult {
     /// Signé + loggé, rien envoyé (dry-run / pas de credentials).
     DryRun,
-    /// Ordre réellement accepté par le CLOB (id renvoyé).
-    Placed(String),
+    /// Ordre réellement accepté par le CLOB.
+    Placed {
+        order_id: String,
+        filled_size: Option<f64>, // tokens effectivement fillés ; None si CLOB n'a pas exposé
+        avg_price: Option<f64>,   // prix moyen d'exécution ; None si CLOB n'a pas exposé
+    },
 }
 
 /// Champs bruts de l'ordre, source unique pour la signature ET le JSON (cohérence garantie).
@@ -176,10 +185,15 @@ struct OrderFields {
 
 impl OrderFields {
     fn build(token_id: &str, args: OrderArgs, creds: &LiveCredentials) -> Self {
-        // BUY : on paie `price*size` USDC pour recevoir `size` shares.
         let usdc = (args.price * args.size * BASE_UNITS).round() as u128;
         let shares = (args.size * BASE_UNITS).round() as u128;
-        let side = match args.side { Side::Up | Side::Down => 0u8 }; // on achète toujours le bon token
+        // BUY  : on donne USDC, on reçoit des shares  → maker=USDC,  taker=shares, side=0
+        // SELL : on donne des shares, on reçoit USDC  → maker=shares, taker=USDC,  side=1
+        let (maker_amount, taker_amount, side) = if args.is_sell {
+            (shares, usdc, 1u8)
+        } else {
+            (usdc, shares, 0u8)
+        };
         OrderFields {
             salt: rand_salt(),
             maker: creds.funder.clone(),
@@ -191,8 +205,8 @@ impl OrderFields {
             },
             taker: "0x0000000000000000000000000000000000000000".into(),
             token_id: token_id.to_string(),
-            maker_amount: usdc,
-            taker_amount: shares,
+            maker_amount,
+            taker_amount,
             expiration: 0, // FAK : pas d'expiration
             nonce: 0,
             fee_rate_bps: 0,
@@ -308,11 +322,28 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
     if !status.is_success() {
         anyhow::bail!("CLOB /order {status}: {text}");
     }
-    let id = serde_json::from_str::<serde_json::Value>(&text).ok()
-        .and_then(|v| v.get("orderID").and_then(|x| x.as_str().map(String::from)))
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let order_id = v.get("orderID").and_then(|x| x.as_str().map(String::from))
         .unwrap_or_else(|| text.clone());
-    tracing::warn!(order_id = %id, "✅ ordre LIVE accepté");
-    Ok(PlaceResult::Placed(id))
+    // CLOB renvoie makingAmount/takingAmount (USDC base units pour le BUY's `taking`).
+    // Sur BUY  : takingAmount = shares reçus,  makingAmount = USDC dépensés.
+    // Sur SELL : makingAmount = shares donnés, takingAmount = USDC reçus.
+    let parse_amount = |k: &str| v.get(k).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
+    let (filled_size, avg_price) = match (parse_amount("makingAmount"), parse_amount("takingAmount")) {
+        (Some(making), Some(taking)) => {
+            // Sens déduit du body envoyé (parsing JSON pour récupérer le "side").
+            let is_sell = serde_json::from_str::<serde_json::Value>(body).ok()
+                .and_then(|b| b.pointer("/order/side").and_then(|s| s.as_u64()).map(|n| n == 1))
+                .unwrap_or(false);
+            let (shares_base, usdc_base) = if is_sell { (making, taking) } else { (taking, making) };
+            let shares = shares_base / BASE_UNITS;
+            let usdc = usdc_base / BASE_UNITS;
+            if shares > 0.0 { (Some(shares), Some(usdc / shares)) } else { (Some(0.0), None) }
+        }
+        _ => (None, None),
+    };
+    tracing::warn!(order_id = %order_id, ?filled_size, ?avg_price, "✅ ordre LIVE accepté");
+    Ok(PlaceResult::Placed { order_id, filled_size, avg_price })
 }
 
 /// Lit la **vraie collatéral USDC** du compte via le CLOB (auth L2, `signature_type`).
@@ -499,26 +530,26 @@ mod tests {
         c.sig_type = 0;
         c.funder = "0x00000000000000000000000000000000000000f0".into();
         c.signer_address = "0x00000000000000000000000000000000000000e0".into();
-        let f0 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0 }, &c);
+        let f0 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0, is_sell: false }, &c);
         assert_eq!(f0.maker, c.funder);
         assert_eq!(f0.signer, c.funder); // EOA : signer == funder
 
         c.sig_type = 2;
-        let f2 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0 }, &c);
+        let f2 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0, is_sell: false }, &c);
         assert_eq!(f2.maker, c.funder);
         assert_eq!(f2.signer, c.signer_address); // proxy : signer = EOA
 
         c.sig_type = 3;
         c.funder = "0x00000000000000000000000000000000000000d0".into();
         c.signer_address = "0x00000000000000000000000000000000000000e0".into();
-        let f3 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0 }, &c);
+        let f3 = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 1.0, is_sell: false }, &c);
         assert_eq!(f3.maker, c.funder);
         assert_eq!(f3.signer, c.funder); // deposit wallet : maker == signer == funder
     }
 
     #[test]
     fn order_type_is_fak_and_amounts_base_units() {
-        let f = OrderFields::build("12345", OrderArgs { side: Side::Up, price: 0.50, size: 10.0 }, &creds());
+        let f = OrderFields::build("12345", OrderArgs { side: Side::Up, price: 0.50, size: 10.0, is_sell: false }, &creds());
         let req = PlaceRequest {
             order: OrderJson::from_fields(&f, String::new()),
             owner: "k".into(),
@@ -555,7 +586,7 @@ mod tests {
     #[cfg(not(feature = "live"))]
     #[test]
     fn sign_refuses_without_feature() {
-        let f = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 5.0 }, &creds());
+        let f = OrderFields::build("1", OrderArgs { side: Side::Up, price: 0.5, size: 5.0, is_sell: false }, &creds());
         assert!(sign_order_eip712(&f, false, &creds().private_key).is_err());
     }
 
@@ -570,7 +601,7 @@ mod tests {
         use alloy::sol_types::{eip712_domain, SolStruct};
 
         let c = creds();
-        let f = OrderFields::build("12345", OrderArgs { side: Side::Up, price: 0.5, size: 5.0 }, &c);
+        let f = OrderFields::build("12345", OrderArgs { side: Side::Up, price: 0.5, size: 5.0, is_sell: false }, &c);
         let sig_hex = sign_order_eip712(&f, false, &c.private_key).unwrap();
         assert!(sig_hex.starts_with("0x") && sig_hex.len() == 132); // 65 octets
 
