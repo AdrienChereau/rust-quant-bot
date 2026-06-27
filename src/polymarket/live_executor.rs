@@ -22,6 +22,21 @@ use sha2::Sha256;
 
 use crate::concurrency::bus::Side;
 
+/// Client HTTP partagé — connexions TCP/TLS maintenues entre les appels (Keep-Alive).
+/// Sans ça, chaque ordre refait un handshake TCP+TLS (~150-250 ms).
+static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .tcp_keepalive(std::time::Duration::from_secs(15))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .expect("reqwest client init")
+});
+
+/// Signer EIP-712 pré-parsé (chemin sig_type != 3) — évite de décoder la clé hex à chaque ordre.
+#[cfg(feature = "live")]
+static CACHED_SIGNER: std::sync::OnceLock<alloy::signers::local::PrivateKeySigner> =
+    std::sync::OnceLock::new();
+
 pub(crate) const CLOB_BASE: &str = "https://clob.polymarket.com";
 const ORDER_TYPE_FAK: &str = "FAK"; // Fill-And-Kill — JAMAIS FOK.
 
@@ -310,7 +325,7 @@ pub async fn place_order(
 async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<PlaceResult> {
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
     let headers = build_l2_headers(creds, &ts, "POST", "/order", body)?;
-    let mut req = reqwest::Client::new()
+    let mut req = HTTP.clone()
         .post(format!("{CLOB_BASE}/order"))
         .header("Content-Type", "application/json");
     for (k, v) in headers {
@@ -355,7 +370,7 @@ pub async fn get_collateral_balance(creds: &LiveCredentials) -> anyhow::Result<f
     let query = format!("asset_type=COLLATERAL&signature_type={}", creds.sig_type);
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
     let headers = build_l2_headers(creds, &ts, "GET", SIGN_PATH, "")?;
-    let mut req = reqwest::Client::new().get(format!("{CLOB_BASE}{SIGN_PATH}?{query}"));
+    let mut req = HTTP.clone().get(format!("{CLOB_BASE}{SIGN_PATH}?{query}"));
     for (k, v) in headers {
         req = req.header(k, v);
     }
@@ -381,7 +396,7 @@ pub async fn sync_balance_allowance(creds: &LiveCredentials) -> anyhow::Result<(
     let query = format!("asset_type=COLLATERAL&signature_type={}", creds.sig_type);
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
     let headers = build_l2_headers(creds, &ts, "GET", SIGN_PATH, "")?;
-    let mut req = reqwest::Client::new().get(format!("{CLOB_BASE}{SIGN_PATH}?{query}"));
+    let mut req = HTTP.clone().get(format!("{CLOB_BASE}{SIGN_PATH}?{query}"));
     for (k, v) in headers {
         req = req.header(k, v);
     }
@@ -400,6 +415,19 @@ pub async fn sync_balance_allowance(creds: &LiveCredentials) -> anyhow::Result<(
 /// plutôt que de trader avec un cache de balance potentiellement périmé.
 pub async fn startup_poly(creds: &LiveCredentials) -> anyhow::Result<()> {
     creds.log_config_check();
+    // Parse le signer EIP-712 une seule fois (chemin sig_type != 3).
+    #[cfg(feature = "live")]
+    {
+        use alloy::signers::local::PrivateKeySigner;
+        match creds.private_key.parse::<PrivateKeySigner>() {
+            Ok(s) => { let _ = CACHED_SIGNER.set(s); }
+            Err(e) => tracing::warn!(error = %e, "pré-parse signer EIP-712 échoué"),
+        }
+        // Cache aussi le LocalSigner POLY_1271 si sig_type=3.
+        if creds.sig_type == 3 {
+            crate::polymarket::poly1271::init_signer(creds)?;
+        }
+    }
     if creds.sig_type == 3 {
         sync_balance_allowance(creds).await
             .map_err(|e| anyhow::anyhow!("sync balance-allowance échouée (deposit wallet): {e}"))?;
@@ -459,8 +487,13 @@ fn sign_order_eip712(f: &OrderFields, neg_risk: bool, private_key: &str) -> anyh
     };
     let hash = order.eip712_signing_hash(&domain);
 
-    let signer: PrivateKeySigner = private_key.parse().map_err(|e| anyhow::anyhow!("clé privée: {e}"))?;
-    let sig = signer.sign_hash_sync(&hash).map_err(|e| anyhow::anyhow!("signature: {e}"))?;
+    // Utilise le signer pré-parsé si disponible (startup_poly), sinon parse la clé à la volée.
+    let sig = if let Some(cached) = CACHED_SIGNER.get() {
+        cached.sign_hash_sync(&hash).map_err(|e| anyhow::anyhow!("signature: {e}"))?
+    } else {
+        let signer: PrivateKeySigner = private_key.parse().map_err(|e| anyhow::anyhow!("clé privée: {e}"))?;
+        signer.sign_hash_sync(&hash).map_err(|e| anyhow::anyhow!("signature: {e}"))?
+    };
     Ok(format!("0x{}", hex::encode(sig.as_bytes())))
 }
 

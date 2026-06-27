@@ -108,7 +108,11 @@ impl LivePositionManager {
         let size_min_cost = clob_min_size_for(min_order_size, order_price);
         let size_final = size.max(size_min_cost);
         let args = OrderArgs { side, price: order_price, size: size_final, is_sell: false };
-        match live_executor::place_order(live_armed, Some(creds), token_id, neg_risk, args).await {
+        let t0 = tokio::time::Instant::now();
+        let result = live_executor::place_order(live_armed, Some(creds), token_id, neg_risk, args).await;
+        let buy_ms = t0.elapsed().as_millis();
+        tracing::info!(buy_ms, side = side.as_str(), token_id, "⏱ latence BUY FAK");
+        match result {
             Ok(PlaceResult::Placed { order_id, filled_size, avg_price }) => {
                 // Fill réel ou fallback sur la taille demandée si le CLOB n'a rien exposé.
                 let entry = avg_price.unwrap_or(order_price);
@@ -210,7 +214,11 @@ impl LivePositionManager {
         let _ = min_order_size; // référence gardée — la garde au-dessus est plus stricte
 
         let args = OrderArgs { side, price: sell_price, size, is_sell: true };
-        match live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args).await {
+        let t0 = tokio::time::Instant::now();
+        let result = live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args).await;
+        let sell_ms = t0.elapsed().as_millis();
+        tracing::info!(sell_ms, reason, token_id = %token_id, "⏱ latence SELL FAK");
+        match result {
             Ok(PlaceResult::Placed { order_id, filled_size, avg_price }) => {
                 let sold = filled_size.unwrap_or(size);
                 let got_price = avg_price.unwrap_or(sell_price);

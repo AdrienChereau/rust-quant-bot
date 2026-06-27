@@ -13,6 +13,22 @@ use polymarket_client_sdk_v2::{POLYGON};
 
 use super::live_executor::{LiveCredentials, OrderArgs, PlaceResult, CLOB_BASE};
 
+/// LocalSigner pré-parsé — évite de décoder la clé hex à chaque ordre POLY_1271.
+static CACHED_LOCAL_SIGNER: std::sync::OnceLock<
+    LocalSigner<alloy::signers::k256::ecdsa::SigningKey>
+> = std::sync::OnceLock::new();
+
+/// Appelé par `startup_poly` pour pré-parser le signer une seule fois.
+pub fn init_signer(creds: &LiveCredentials) -> anyhow::Result<()> {
+    if CACHED_LOCAL_SIGNER.get().is_some() { return Ok(()); }
+    let s = LocalSigner::from_str(&creds.private_key)
+        .map_err(|e| anyhow::anyhow!("POLY_PRIVATE_KEY: {e}"))?
+        .with_chain_id(Some(POLYGON));
+    let _ = CACHED_LOCAL_SIGNER.set(s);
+    tracing::info!("LocalSigner POLY_1271 pré-parsé");
+    Ok(())
+}
+
 /// Dérive ou crée les credentials L2 CLOB (flow L1) — à lancer en local one-shot.
 pub async fn derive_api_creds(creds: &LiveCredentials) -> anyhow::Result<Credentials> {
     let signer = local_signer(creds)?;
@@ -129,6 +145,10 @@ async fn authenticated_client<S: Signer>(
 }
 
 fn local_signer(creds: &LiveCredentials) -> anyhow::Result<LocalSigner<alloy::signers::k256::ecdsa::SigningKey>> {
+    // Retourne le signer pré-parsé si dispo (init_signer appelé au démarrage), sinon parse.
+    if let Some(s) = CACHED_LOCAL_SIGNER.get() {
+        return Ok(s.clone());
+    }
     Ok(LocalSigner::from_str(&creds.private_key)
         .map_err(|e| anyhow::anyhow!("POLY_PRIVATE_KEY: {e}"))?
         .with_chain_id(Some(POLYGON)))
