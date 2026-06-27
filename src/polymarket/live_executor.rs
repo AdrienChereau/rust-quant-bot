@@ -231,12 +231,11 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
 /// Read-only : sert de pré-flight d'auth (mêmes en-têtes que le POST d'ordre) ET de bankroll live.
 /// `GET /balance-allowance?asset_type=COLLATERAL&signature_type=N`.
 pub async fn get_collateral_balance(creds: &LiveCredentials) -> anyhow::Result<f64> {
-    // ⚠️ On signe le chemin SANS query string (comme py-clob-client) ; la query part dans l'URL.
-    let sign_path = "/balance-allowance";
-    let query = format!("asset_type=COLLATERAL&signature_type={}", creds.sig_type);
+    // Polymarket L2 : le chemin signé doit inclure la query string complète pour les GET.
+    let full_path = format!("/balance-allowance?asset_type=COLLATERAL&signature_type={}", creds.sig_type);
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
-    let headers = build_l2_headers(creds, &ts, "GET", sign_path, "")?;
-    let mut req = reqwest::Client::new().get(format!("{CLOB_BASE}{sign_path}?{query}"));
+    let headers = build_l2_headers(creds, &ts, "GET", &full_path, "")?;
+    let mut req = reqwest::Client::new().get(format!("{CLOB_BASE}{full_path}"));
     for (k, v) in headers {
         req = req.header(k, v);
     }
@@ -397,6 +396,17 @@ mod tests {
         assert_eq!(a, b);
         assert!(base64::engine::general_purpose::URL_SAFE.decode(&a).is_ok());
         assert_ne!(a, l2_signature(&c.api_secret, "1700000001", "POST", "/order", "{}").unwrap());
+    }
+
+    #[test]
+    fn l2_get_includes_query_in_path() {
+        let c = creds();
+        let path = "/balance-allowance?asset_type=COLLATERAL&signature_type=3";
+        let sig = l2_signature(&c.api_secret, "1700000000", "GET", path, "").unwrap();
+        assert_ne!(
+            sig,
+            l2_signature(&c.api_secret, "1700000000", "GET", "/balance-allowance", "").unwrap()
+        );
     }
 
     #[cfg(not(feature = "live"))]
