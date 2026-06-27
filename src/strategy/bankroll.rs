@@ -131,7 +131,7 @@ impl PaperEngine {
         });
         self.state.shots += 1;
         self.append("fire", side.as_str(), avg_price, filled, 0.0);
-        tracing::warn!(side = side.as_str(), entry = format!("{:.3}", avg_price),
+        tracing::warn!(side = side.as_str(), token_id, entry = format!("{:.3}", avg_price),
             size = filled, tp = format!("{:.2}", tp), "🎯 SNIPE");
         true
     }
@@ -166,7 +166,7 @@ impl PaperEngine {
         let eq = self.state.cash;
         if eq > self.state.peak_equity { self.state.peak_equity = eq; }
         self.append(reason, p.side.as_str(), exit_price, p.size, pnl);
-        tracing::warn!(reason, exit = format!("{:.3}", exit_price), pnl = format!("{:.2}", pnl),
+        tracing::warn!(reason, token_id = p.token_id, exit = format!("{:.3}", exit_price), pnl = format!("{:.2}", pnl),
             cash = format!("{:.2}", self.state.cash), "✖ clôture");
         self.persist();
     }

@@ -36,6 +36,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
     let controls = Arc::new(RuntimeControls::new());
     let live_creds = LiveCredentials::from_env();
+    if let Some(ref c) = live_creds {
+        live_executor::startup_poly(c).await;
+    }
     if cfg.live_armed {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
     }

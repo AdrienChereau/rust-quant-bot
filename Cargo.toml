@@ -11,10 +11,8 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["json", "native-tls"] }
-crossbeam-channel = "0.5"
 statrs = "0.16"           # CDF normale (Black-Scholes)
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -32,11 +30,12 @@ hex = "0.4"
 # ⚠️ alloy 2.1 requiert rustc ≥ 1.91. La feature `live` ne compile donc QUE sur un toolchain récent
 # (les nœuds AWS via rustup l'ont ; le build paper par défaut, lui, reste sur n'importe quel rustc).
 alloy = { version = "2.1", default-features = false, features = ["signer-local", "sol-types"], optional = true }
+polymarket_client_sdk_v2 = { version = "0.5.1", default-features = false, features = ["clob"], optional = true }
 
 [features]
 default = []
-# `cargo build --features live` : compile la signature EIP-712 réelle (alloy).
-live = ["dep:alloy"]
+# `cargo build --features live` : signature EIP-712 (alloy) + SDK Polymarket (POLY_1271 / sig_type=3).
+live = ["dep:alloy", "dep:polymarket_client_sdk_v2"]
 
 [profile.release]
 opt-level = 3

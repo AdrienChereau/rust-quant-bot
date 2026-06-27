@@ -120,8 +120,11 @@ cargo build --release --features live
 Le dashboard (et ses endpoints POST `/live/enable`…) écoute sur `0.0.0.0`. **Le binder sur
 localhost/Tailscale ou le protéger** avant `LIVE_ARMED=true` — sinon n'importe qui sur le réseau
 peut basculer les modes. Confirmer aussi l'`EXCHANGE_CTF` (neg-risk = adresse différente) et le
-`POLY_SIG_TYPE` (0 ou 2) pour ton compte MetaMask.
+`POLY_SIG_TYPE` (0, 2 ou **3** deposit wallet POLY_1271) pour ton compte.
 
-### Credentials
-`POLY_*` générés via `scripts/derive_poly_creds.py` (flow L1 hors bot), dans `.env` sur AWS
-(jamais commité). Voir `.env.example` et `docs/METAMASK-SETUP.md`.
+### Credentials (Rust only — pas de Python sur AWS)
+1. **Local** : `cargo run --release --features live -- poly derive-creds` → copier `POLY_API_*` dans `.env` AWS
+2. **AWS preflight** : `cargo run --release --features live -- poly verify`
+3. **Dry-run ordre** : `cargo run --release --features live -- poly dry-order --token-id <ID>`
+
+Voir `.env.example`, `docs/METAMASK-SETUP.md` et **`docs/AWS-TEST-GUIDE.md`** (guide pas-à-pas sur le serveur).

@@ -4,12 +4,12 @@
 //!   - `radar`    : nœud Tokyo, émet les signaux OBI en UDP (`roles::radar`).
 //!   - `executor` : nœud Dublin, écoute l'UDP + exécute en paper (`roles::executor`).
 //!   - `mono`     : radar+exécuteur dans le même processus (défaut, run local/cloudy) — ci-dessous.
+//!   - `poly`     : outils Polymarket (verify, derive-creds, dry-order) — ops Rust sans Python.
 
 mod binance;
 mod concurrency;
 mod config;
 mod dashboard;
-mod error;
 mod latency;
 mod net;
 mod okx;
@@ -31,6 +31,7 @@ use config::Config;
 use polymarket::relayer::{btc_price_at_window_open, Market, PolyBook, PolymarketClient};
 use pricing::black_scholes::{fair_up_probability, years_from_secs};
 use pricing::volatility::VolatilityTracker;
+use polymarket::cli::{self, PolyCmd};
 use polymarket::live_executor::{self, LiveCredentials, OrderArgs};
 use signal::consolidated_obi::ConsolidatedObi;
 use state::RuntimeControls;
@@ -63,6 +64,11 @@ enum Mode {
     },
     /// Mono : radar + exécuteur in-process (loopback). Mode par défaut (run local / cloudy).
     Mono,
+    /// Outils Polymarket (setup + preflight) — remplace scripts Python sur AWS.
+    Poly {
+        #[command(subcommand)]
+        cmd: PolyCmd,
+    },
 }
 
 #[tokio::main]
@@ -79,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         Mode::Radar { target_ip, target_port } => roles::radar::run(cfg, target_ip, target_port).await,
         Mode::Executor { listen_port } => roles::executor::run(cfg, listen_port).await,
         Mode::Mono => run_mono(cfg).await,
+        Mode::Poly { cmd } => cli::run(cmd, cfg).await,
     }
 }
 
@@ -99,6 +106,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     // Contrôle d'exécution lock-free (pause/live/breaker), partagé avec le dashboard.
     let controls = Arc::new(RuntimeControls::new());
     let live_creds = LiveCredentials::from_env();
+    if let Some(ref c) = live_creds {
+        live_executor::startup_poly(c).await;
+    }
     if cfg.live_armed {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
     }
@@ -316,7 +326,7 @@ fn spawn_pm_task(pm: Arc<Mutex<PmShared>>) {
             if need {
                 if let Ok(Some(m)) = client.get_current_btc_5m_market().await {
                     let strike = btc_price_at_window_open(m.window_ts).await.ok();
-                    tracing::info!(slug = %m.slug, strike = ?strike, "=== nouveau marché ===");
+                    tracing::info!(slug = %m.slug, strike = ?strike, neg_risk = m.neg_risk, "=== nouveau marché ===");
                     let mut g = pm.lock().unwrap();
                     g.market = Some(m); g.strike = strike;
                 }

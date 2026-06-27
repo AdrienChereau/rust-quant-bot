@@ -15,11 +15,16 @@ Compare les deux adresses :
 
 **Même adresse** → `POLY_SIG_TYPE=0` (EOA pur — ton cas probable si tu as déposé via l'UI sans proxy distinct).
 
-**Adresses différentes** → `POLY_SIG_TYPE=2` (Gnosis Safe proxy). Dans ce cas :
+**Adresses différentes (proxy Gnosis)** → `POLY_SIG_TYPE=2` :
 - `POLY_FUNDER_ADDRESS` = adresse du profil Polymarket (proxy)
 - `POLY_SIGNER_ADDRESS` = adresse MetaMask (EOA)
 
-> Le bot supporte `sig_type` 0, 1 et 2. **Pas** le `sig_type=3` (deposit wallet Magic).
+**Deposit wallet (compte Polymarket 2026+)** → `POLY_SIG_TYPE=3` (POLY_1271) :
+- `POLY_FUNDER_ADDRESS` = adresse deposit wallet (settings Polymarket)
+- `POLY_SIGNER_ADDRESS` = MetaMask EOA owner
+- Ordres V2 + signature ERC-7739 (SDK Rust, feature `live`)
+
+Le bot supporte `sig_type` 0, 1, 2 et **3**.
 
 ---
 
@@ -33,26 +38,19 @@ Compare les deux adresses :
 
 ---
 
-## 3. Régénérer les credentials API L2
-
-Les anciennes clés (compte Magic) ne fonctionnent pas. Il faut en créer de nouvelles liées à MetaMask.
+## 3. Régénérer les credentials API L2 (Rust)
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r scripts/requirements.txt
-python scripts/derive_poly_creds.py   # lit .env / .env.local automatiquement
+rustup update stable   # alloy exige rustc ≥ 1.91
+cargo build --release --features live
+
+# Remplir POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS, POLY_SIG_TYPE dans .env d'abord
+cargo run --release --features live -- poly derive-creds
 ```
 
-Ou avec export manuel :
+Le CLI affiche `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE` à copier dans `.env`.
 
-```bash
-export POLY_PRIVATE_KEY=0x<VOTRE_CLE>
-export POLY_FUNDER_ADDRESS=0x<PROXY_POLymarket>
-export POLY_SIG_TYPE=2
-python scripts/derive_poly_creds.py
-```
-
-Le script affiche `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE` à copier dans `.env`.
+> Scripts Python (`scripts/derive_poly_creds.py`) : optionnels en dev local uniquement. **Pas de Python sur AWS.**
 
 ---
 
@@ -73,13 +71,28 @@ POLY_PASSPHRASE=...
 LIVE_ARMED=false
 ```
 
-Exemple pour **sig_type=2** (proxy Polymarket) :
+Exemple pour **sig_type=2** (proxy Gnosis) :
 
 ```env
-POLY_PRIVATE_KEY=0x...           # clé MetaMask
+POLY_PRIVATE_KEY=0x...
 POLY_FUNDER_ADDRESS=0x...        # proxy (settings Polymarket)
-POLY_SIGNER_ADDRESS=0x...        # adresse MetaMask EOA
+POLY_SIGNER_ADDRESS=0x...        # MetaMask EOA
 POLY_SIG_TYPE=2
+```
+
+Exemple pour **sig_type=3** (deposit wallet POLY_1271) :
+
+```env
+POLY_PRIVATE_KEY=0x...           # clé MetaMask owner
+POLY_FUNDER_ADDRESS=0x...        # deposit wallet (settings Polymarket)
+POLY_SIGNER_ADDRESS=0x...        # MetaMask EOA
+POLY_SIG_TYPE=3
+
+POLY_API_KEY=...
+POLY_API_SECRET=...
+POLY_PASSPHRASE=...
+
+LIVE_ARMED=false
 ```
 
 ---
@@ -99,17 +112,19 @@ cargo build --release --features live
 ### Étape A — Vérifier le solde CLOB
 
 ```bash
-cargo run --release --features live
+cargo run --release --features live -- poly verify
+# → OK — balance CLOB : X.XX USDC
 ```
 
-Active **Live ON** au dashboard (`http://localhost:8768`). Le champ **live bankroll** doit afficher ton solde déposé (~5 $). Si erreur auth → revoir credentials ou `POLY_SIG_TYPE`.
+Ou lancer le bot et vérifier le dashboard : **live bankroll** doit afficher ton solde.
 
 ### Étape B — Dry-Run Live (`LIVE_ARMED=false`)
 
 1. Garde `LIVE_ARMED=false`
 2. Active Live ON + ▶ Live au dashboard
-3. Dans les logs, cherche `LIVE order signé` avec `"orderType":"FAK"` et `"signatureType":0`
-4. **Aucun ordre n'est envoyé** — c'est normal
+3. Dans les logs, cherche `LIVE order signé` avec `"orderType":"FAK"` et le bon `signatureType` (0/2 ou 3)
+4. Ou : `cargo run --release --features live -- poly dry-order --token-id <ID> --price 0.01 --size 1`
+5. **Aucun ordre n'est envoyé** — c'est normal
 
 ### Étape C — Micro-test réel (`LIVE_ARMED=true`)
 
@@ -128,9 +143,10 @@ Teste `MAX_DRAWDOWN=1` ou le bouton breaker du dashboard pour confirmer l'arrêt
 ## Checklist rapide
 
 - [ ] Fonds visibles sur polymarket.com
-- [ ] `POLY_SIG_TYPE` confirmé (0 ou 2)
+- [ ] `POLY_SIG_TYPE` confirmé (0, 2 ou 3)
 - [ ] Clé privée MetaMask exportée → `POLY_PRIVATE_KEY`
-- [ ] Credentials API régénérés via `scripts/derive_poly_creds.py`
+- [ ] Credentials API via `poly derive-creds` (local)
+- [ ] Preflight AWS : `poly verify` OK
 - [ ] `.env` mis à jour (7 variables `POLY_*`)
 - [ ] `cargo build --release --features live` OK
 - [ ] Solde CLOB visible au dashboard
@@ -141,11 +157,11 @@ Teste `MAX_DRAWDOWN=1` ou le bouton breaker du dashboard pour confirmer l'arrêt
 
 ## Déploiement AWS
 
-Sur le serveur, copie `.env` (pas `.env.local`) avec les 7 variables `POLY_*`.
-Rebuild avec `--features live` :
+Sur le serveur, copie `.env` avec les 7 variables `POLY_*`. **Pas de Python.**
 
 ```bash
 cargo build --release --features live
+cargo run --release --features live -- poly verify
 sudo systemctl restart rust-quant-bot-executor
 tail -f ~/rust-quant-bot/data/executor.log | grep -iE "bankroll|balance"
 ```
@@ -156,7 +172,7 @@ régénérés pour le mauvais wallet ou `POLY_SIG_TYPE` incorrect.
 
 | Symptôme | Cause probable | Fix |
 |----------|----------------|-----|
-| `401 Unauthorized` | Credentials obsolètes ou mauvais wallet | Régénérer via le script |
+| `401 Unauthorized` | Credentials obsolètes ou mauvais wallet | `poly derive-creds` puis `poly verify` |
 | `INVALID_SIGNATURE` | Mauvais `POLY_SIG_TYPE` | Revoir comparaison adresses (§1) |
 | `Invalid Funder Address` | Funder = MetaMask au lieu du proxy | Utiliser l'adresse settings Polymarket |
 | Solde CLOB = 0 | Mauvais `signature_type` dans la requête balance | Aligner `POLY_SIG_TYPE` |

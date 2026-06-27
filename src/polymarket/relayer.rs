@@ -19,6 +19,7 @@ pub struct Market {
     pub window_ts: i64,
     pub tick_size: f64,
     pub min_order_size: f64,
+    pub neg_risk: bool,
 }
 
 impl Market {
@@ -48,10 +49,6 @@ impl PolyBook {
     }
     pub fn mid(&self) -> Option<f64> {
         Some((self.best_bid()? + self.best_ask()?) / 2.0)
-    }
-    /// Liquidité cumulée des asks ≤ price (pour le slippage d'un achat taker).
-    pub fn ask_liquidity_to(&self, price: f64) -> f64 {
-        self.asks.iter().filter(|l| l.price <= price + 1e-9).map(|l| l.size).sum()
     }
 }
 
@@ -111,6 +108,7 @@ impl PolymarketClient {
         let end_time = DateTime::parse_from_rfc3339(end_str)
             .map(|d| d.with_timezone(&Utc))
             .map_err(|e| anyhow::anyhow!("endDate '{end_str}': {e}"))?;
+        let neg_risk = m.get("negRisk").and_then(|v| v.as_bool()).unwrap_or(false);
         Ok(Some(Market {
             slug: slug.to_string(),
             up_token_id: token_ids[up_idx].clone(),
@@ -119,6 +117,7 @@ impl PolymarketClient {
             window_ts,
             tick_size: num_field(m, "orderPriceMinTickSize").unwrap_or(0.01),
             min_order_size: num_field(m, "orderMinSize").unwrap_or(5.0),
+            neg_risk,
         }))
     }
 
