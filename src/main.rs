@@ -63,8 +63,6 @@ enum Mode {
     },
     /// Mono : radar + exécuteur in-process (loopback). Mode par défaut (run local / cloudy).
     Mono,
-    /// Pré-flight auth L2 Polymarket : vérifie `.env` + `GET /balance-allowance`.
-    PolyCheck,
 }
 
 #[tokio::main]
@@ -79,19 +77,6 @@ async fn main() -> anyhow::Result<()> {
         Mode::Radar { target_ip, target_port } => roles::radar::run(cfg, target_ip, target_port).await,
         Mode::Executor { listen_port } => roles::executor::run(cfg, listen_port).await,
         Mode::Mono => run_mono(cfg).await,
-        Mode::PolyCheck => run_poly_check().await,
-    }
-}
-
-async fn run_poly_check() -> anyhow::Result<()> {
-    let creds = LiveCredentials::from_env()
-        .ok_or_else(|| anyhow::anyhow!("POLY_* incomplets — voir .env.example"))?;
-    match live_executor::check_auth(&creds).await {
-        Ok(usdc) => {
-            tracing::info!(usdc = format!("{usdc:.2}"), "✅ auth L2 OK — bankroll CLOB");
-            Ok(())
-        }
-        Err(e) => anyhow::bail!("auth L2 échouée: {e}"),
     }
 }
 
@@ -119,7 +104,6 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     // Vraie collatéral USDC (CLOB) — bankroll pour le sizing LIVE (jamais le cash paper).
     let live_bankroll = Arc::new(Mutex::new(None::<f64>));
     if let Some(creds) = live_creds.clone() {
-        creds.validate();
         let bk = live_bankroll.clone();
         tokio::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_secs(30));

@@ -43,7 +43,6 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     // Vraie collatéral USDC (CLOB) — lue toutes les 30 s ; sert de bankroll pour le sizing LIVE.
     let live_bankroll = Arc::new(Mutex::new(None::<f64>));
     if let Some(creds) = live_creds.clone() {
-        creds.validate();
         let bk = live_bankroll.clone();
         tokio::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_secs(30));
