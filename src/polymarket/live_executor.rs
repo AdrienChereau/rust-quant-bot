@@ -42,20 +42,25 @@ pub struct LiveCredentials {
     pub api_key: String,
     pub api_secret: String, // base64 url-safe
     pub passphrase: String,
-    pub funder: String,      // adresse maker (deposit wallet)
-    pub private_key: String, // EOA qui signe l'EIP-712
-    pub sig_type: u8,        // POLY_SIG_TYPE (défaut 3, deposit wallet)
+    pub funder: String,         // adresse maker (deposit wallet) — utilisée dans l'ORDRE
+    pub signer_address: String, // adresse EOA (signataire) — utilisée dans l'AUTH L2 (POLY_ADDRESS)
+    pub private_key: String,    // EOA qui signe l'EIP-712
+    pub sig_type: u8,           // POLY_SIG_TYPE (défaut 3, deposit wallet)
 }
 
 impl LiveCredentials {
     /// Charge depuis l'environnement. `None` si un seul champ manque (→ pas de live possible).
+    /// `POLY_SIGNER_ADDRESS` = adresse de ton EOA (celle liée à l'API key) ; par défaut = funder
+    /// (correct seulement en sig_type 0 où EOA == funder).
     pub fn from_env() -> Option<Self> {
         let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let funder = get("POLY_FUNDER_ADDRESS")?;
         Some(Self {
             api_key: get("POLY_API_KEY")?,
             api_secret: get("POLY_API_SECRET")?,
             passphrase: get("POLY_PASSPHRASE")?,
-            funder: get("POLY_FUNDER_ADDRESS")?,
+            signer_address: get("POLY_SIGNER_ADDRESS").unwrap_or_else(|| funder.clone()),
+            funder,
             private_key: get("POLY_PRIVATE_KEY")?,
             sig_type: std::env::var("POLY_SIG_TYPE").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
         })
@@ -226,10 +231,12 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
 /// Read-only : sert de pré-flight d'auth (mêmes en-têtes que le POST d'ordre) ET de bankroll live.
 /// `GET /balance-allowance?asset_type=COLLATERAL&signature_type=N`.
 pub async fn get_collateral_balance(creds: &LiveCredentials) -> anyhow::Result<f64> {
-    let path = format!("/balance-allowance?asset_type=COLLATERAL&signature_type={}", creds.sig_type);
+    // ⚠️ On signe le chemin SANS query string (comme py-clob-client) ; la query part dans l'URL.
+    let sign_path = "/balance-allowance";
+    let query = format!("asset_type=COLLATERAL&signature_type={}", creds.sig_type);
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
-    let headers = build_l2_headers(creds, &ts, "GET", &path, "")?;
-    let mut req = reqwest::Client::new().get(format!("{CLOB_BASE}{path}"));
+    let headers = build_l2_headers(creds, &ts, "GET", sign_path, "")?;
+    let mut req = reqwest::Client::new().get(format!("{CLOB_BASE}{sign_path}?{query}"));
     for (k, v) in headers {
         req = req.header(k, v);
     }
@@ -324,7 +331,8 @@ pub fn build_l2_headers(
 ) -> anyhow::Result<Vec<(String, String)>> {
     let sig = l2_signature(&creds.api_secret, timestamp, method, path, body)?;
     Ok(vec![
-        ("POLY_ADDRESS".into(), creds.funder.clone()),
+        // POLY_ADDRESS = l'EOA signataire (à qui l'API key est rattachée), PAS le funder.
+        ("POLY_ADDRESS".into(), creds.signer_address.clone()),
         ("POLY_SIGNATURE".into(), sig),
         ("POLY_TIMESTAMP".into(), timestamp.to_string()),
         ("POLY_API_KEY".into(), creds.api_key.clone()),
@@ -358,6 +366,7 @@ mod tests {
             api_secret: base64::engine::general_purpose::URL_SAFE.encode([7u8; 32]),
             passphrase: "pass".into(),
             funder: "0x0000000000000000000000000000000000000abc".into(),
+            signer_address: "0x0000000000000000000000000000000000000abc".into(),
             // clé de test connue (compte de dev Ethereum jamais utilisé en prod).
             private_key: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".into(),
             sig_type: 3,
