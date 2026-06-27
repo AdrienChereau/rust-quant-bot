@@ -6,7 +6,7 @@ use std::str::FromStr as _;
 
 use polymarket_client_sdk_v2::auth::{Credentials, LocalSigner, Normal, Signer};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{OrderSignature, OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::{POLYGON};
@@ -63,10 +63,23 @@ pub async fn place_order_poly1271(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let signed = client.sign(&signer, signable).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let sig_len = match &signed.signature {
+        OrderSignature::Wrapped(s) => s.len(),
+        OrderSignature::Ecdsa(_) => 65,
+        _ => 0,
+    };
+    if !matches!(&signed.signature, OrderSignature::Wrapped(_)) {
+        tracing::error!(
+            signature_len = sig_len,
+            "POLY_1271 : signature ECDSA — attendu ERC-7739 Wrapped (~600+ car.). \
+             Vérifiez polymarket_client_sdk_v2 >= 0.6.0-canary.1"
+        );
+        anyhow::bail!("signature POLY_1271 invalide ({sig_len} car.) — rebuild avec SDK canary");
+    }
     tracing::warn!(
         order_type = "FAK",
         signature_type = 3,
-        signature_len = signed.signature.as_bytes().len(),
+        signature_len = sig_len,
         "LIVE order POLY_1271 signé"
     );
 

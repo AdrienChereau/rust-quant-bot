@@ -30,7 +30,7 @@ hex = "0.4"
 # ⚠️ alloy 2.1 requiert rustc ≥ 1.91. La feature `live` ne compile donc QUE sur un toolchain récent
 # (les nœuds AWS via rustup l'ont ; le build paper par défaut, lui, reste sur n'importe quel rustc).
 alloy = { version = "2.1", default-features = false, features = ["signer-local", "sol-types"], optional = true }
-polymarket_client_sdk_v2 = { version = "0.5.1", default-features = false, features = ["clob"], optional = true }
+polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", default-features = false, features = ["clob"], optional = true }
 
 [features]
 default = []

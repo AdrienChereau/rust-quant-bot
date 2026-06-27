@@ -12,7 +12,7 @@ pub enum PolyCmd {
     Verify,
     /// Dérive POLY_API_KEY/SECRET/PASSPHRASE via L1 (SDK v2). À lancer en local.
     DeriveCreds,
-    /// Signe + log un ordre FAK test (dry-run sauf si LIVE_ARMED=true).
+    /// Signe + log un ordre FAK test (jamais POSTé — dry-run forcé).
     DryOrder {
         #[arg(long)]
         token_id: String,
@@ -23,12 +23,12 @@ pub enum PolyCmd {
     },
 }
 
-pub async fn run(cmd: PolyCmd, cfg: Config) -> anyhow::Result<()> {
+pub async fn run(cmd: PolyCmd, _cfg: Config) -> anyhow::Result<()> {
     match cmd {
         PolyCmd::Verify => verify().await,
         PolyCmd::DeriveCreds => derive_creds().await,
         PolyCmd::DryOrder { token_id, price, size } => {
-            dry_order(cfg, &token_id, price, size).await
+            dry_order(&token_id, price, size).await
         }
     }
 }
@@ -62,11 +62,11 @@ async fn derive_creds() -> anyhow::Result<()> {
     }
 }
 
-async fn dry_order(cfg: Config, token_id: &str, price: f64, size: f64) -> anyhow::Result<()> {
+async fn dry_order(token_id: &str, price: f64, size: f64) -> anyhow::Result<()> {
     let creds = LiveCredentials::from_env()
         .ok_or_else(|| anyhow::anyhow!("credentials POLY_* incomplètes"))?;
     let args = OrderArgs { side: Side::Up, price, size };
-    let result = live_executor::place_order(cfg.live_armed, Some(&creds), token_id, args).await?;
+    let result = live_executor::place_order(false, Some(&creds), token_id, args).await?;
     match result {
         live_executor::PlaceResult::DryRun => println!("Dry-run OK — ordre signé, non POSTé"),
         live_executor::PlaceResult::Placed(id) => println!("Ordre accepté : {id}"),
