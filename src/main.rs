@@ -105,6 +105,9 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     if cfg.live_armed {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible (si signature vérifiée)");
     }
+    if cfg.live_force_min_size {
+        tracing::warn!("⚠️  LIVE_FORCE_MIN_SIZE=true — taille minimale forcée (Kelly ignoré, agressif)");
+    }
 
     // Vraie collatéral USDC (CLOB) — bankroll pour le sizing LIVE (jamais le cash paper).
     let live_bankroll = Arc::new(Mutex::new(None::<f64>));
@@ -249,11 +252,22 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                             None => tracing::warn!("LIVE actif mais bankroll réelle pas encore lue — tir ignoré"),
                             Some(bk) => {
                                 let price = book.best_ask().unwrap_or(real_up);
-                                let size_k = paper.kelly_size_for(gap.abs(), price, bk);
-                                match bankroll::adjust_size_to_min(size_k, m.min_order_size) {
+                                // Sizing : Kelly normal, OU taille minimale forcée (micro-test).
+                                let sized = if cfg.live_force_min_size {
+                                    Some(m.min_order_size)
+                                } else {
+                                    bankroll::adjust_size_to_min(paper.kelly_size_for(gap.abs(), price, bk), m.min_order_size)
+                                };
+                                match sized {
                                     None => tracing::info!(reason = "taille sous le minimum",
-                                        kelly = format!("{size_k:.1}"), min = m.min_order_size, "✗ ordre live ignoré"),
+                                        min = m.min_order_size, "✗ ordre live ignoré"),
+                                    Some(size) if size * price > bk => tracing::warn!(
+                                        cost = format!("{:.2}", size * price), bankroll = format!("{bk:.2}"),
+                                        "✗ ordre live ignoré — bankroll insuffisante"),
                                     Some(size) => {
+                                        if cfg.live_force_min_size {
+                                            tracing::warn!(size, "⚠️ taille FORCÉE au minimum (LIVE_FORCE_MIN_SIZE)");
+                                        }
                                         let args = OrderArgs { side, price, size };
                                         match live_executor::place_order(cfg.live_armed, live_creds.as_ref(), token, m.neg_risk, args).await {
                                             Ok(live_executor::PlaceResult::Placed(id)) => {
@@ -337,6 +351,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             d.live_bankroll = *live_bankroll.lock().unwrap();
             d.live_pnl = live_pnl_val;
             d.live_shots = live_shots;
+            d.live_force_min = cfg.live_force_min_size;
         }
 
         log_throttle += 1;

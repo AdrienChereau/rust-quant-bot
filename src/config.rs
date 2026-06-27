@@ -45,6 +45,8 @@ pub struct Config {
     // Live testing (passage paper → réel)
     pub max_drawdown: f64,     // circuit breaker sur l'equity (en $)
     pub live_armed: bool,      // LIVE_ARMED : verrou matériel pour l'envoi RÉEL d'ordres
+    pub live_force_min_size: bool, // LIVE_FORCE_MIN_SIZE : ignore Kelly, force la taille minimale
+                                   // (agressif — micro-test plomberie sur petite bankroll)
 }
 
 impl Config {
@@ -83,6 +85,7 @@ impl Config {
 
             max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
             live_armed: env_or("LIVE_ARMED", false),
+            live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
         }
     }
 }
