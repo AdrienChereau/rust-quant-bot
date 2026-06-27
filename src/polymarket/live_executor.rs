@@ -45,7 +45,7 @@ pub struct LiveCredentials {
     pub funder: String,         // adresse maker (deposit wallet) — utilisée dans l'ORDRE
     pub signer_address: String, // adresse EOA (signataire) — utilisée dans l'AUTH L2 (POLY_ADDRESS)
     pub private_key: String,    // EOA qui signe l'EIP-712
-    pub sig_type: u8,           // POLY_SIG_TYPE (défaut 3, deposit wallet)
+    pub sig_type: u8,           // POLY_SIG_TYPE (défaut 1, Google/email Magic proxy)
 }
 
 impl LiveCredentials {
@@ -62,9 +62,58 @@ impl LiveCredentials {
             signer_address: get("POLY_SIGNER_ADDRESS").unwrap_or_else(|| funder.clone()),
             funder,
             private_key: get("POLY_PRIVATE_KEY")?,
-            sig_type: std::env::var("POLY_SIG_TYPE").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+            sig_type: std::env::var("POLY_SIG_TYPE").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
         })
     }
+
+    /// Vérifie la cohérence des credentials (logs WARN si config 401 probable).
+    pub fn validate(&self) {
+        if std::env::var("POLY_SIGNER_ADDRESS").ok().filter(|v| !v.is_empty()).is_none() {
+            tracing::warn!(
+                sig_type = self.sig_type,
+                "POLY_SIGNER_ADDRESS absent — fallback funder ; auth L2 401 probable si sig_type 1 ou 3"
+            );
+        }
+        if (self.sig_type == 1 || self.sig_type == 3)
+            && self.signer_address.eq_ignore_ascii_case(&self.funder)
+        {
+            tracing::warn!(
+                sig_type = self.sig_type,
+                "POLY_SIGNER_ADDRESS == POLY_FUNDER_ADDRESS — auth L2 401 probable (EOA ≠ funder)"
+            );
+        }
+        #[cfg(feature = "live")]
+        match derived_eoa_address(&self.private_key) {
+            Ok(derived) if !derived.eq_ignore_ascii_case(&self.signer_address) => {
+                tracing::warn!(
+                    signer = %self.signer_address,
+                    derived = %derived,
+                    "POLY_SIGNER_ADDRESS ≠ adresse dérivée de POLY_PRIVATE_KEY — auth L2 401 probable"
+                );
+            }
+            Err(e) => tracing::warn!(error = %e, "POLY_PRIVATE_KEY invalide"),
+            _ => {}
+        }
+        tracing::info!(
+            signer = %self.signer_address,
+            funder = %self.funder,
+            sig_type = self.sig_type,
+            "credentials POLY_* chargés"
+        );
+    }
+}
+
+/// Pré-flight auth L2 : `GET /balance-allowance` (même stack que la bankroll live).
+pub async fn check_auth(creds: &LiveCredentials) -> anyhow::Result<f64> {
+    creds.validate();
+    get_collateral_balance(creds).await
+}
+
+#[cfg(feature = "live")]
+fn derived_eoa_address(private_key: &str) -> anyhow::Result<String> {
+    use alloy::signers::local::PrivateKeySigner;
+    let signer: PrivateKeySigner = private_key.parse().map_err(|e| anyhow::anyhow!("clé privée: {e}"))?;
+    Ok(format!("{}", signer.address()))
 }
 
 /// Paramètres d'un ordre à placer (côté stratégie).
@@ -109,7 +158,7 @@ impl OrderFields {
         OrderFields {
             salt: rand_salt(),
             maker: creds.funder.clone(),
-            signer: creds.funder.clone(), // sig_type 3 : maker == signer
+            signer: creds.funder.clone(), // sig_type 1/3 : maker == funder (proxy ou deposit wallet)
             taker: "0x0000000000000000000000000000000000000000".into(),
             token_id: token_id.to_string(),
             maker_amount: usdc,

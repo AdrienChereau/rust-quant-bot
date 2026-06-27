@@ -120,7 +120,7 @@ cargo build --release --features live
 Le dashboard (et ses endpoints POST `/live/enable`…) écoute sur `0.0.0.0`. **Le binder sur
 localhost/Tailscale ou le protéger** avant `LIVE_ARMED=true` — sinon n'importe qui sur le réseau
 peut basculer les modes. Confirmer aussi l'`EXCHANGE_CTF` (neg-risk = adresse différente) et le
-`signatureType` (3) pour ton compte.
+`POLY_SIG_TYPE` adapté à ton compte (Google/email → `1`, deposit wallet API → `3`).
 
 ### Credentials
 `POLY_API_KEY/SECRET/PASSPHRASE/FUNDER_ADDRESS/PRIVATE_KEY` générés EN AMONT (flow L1 hors bot),
