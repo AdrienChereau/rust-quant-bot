@@ -16,7 +16,7 @@ use crate::net::wire::WireSignal;
 use crate::polymarket::live_executor::{self, LiveCredentials};
 use crate::polymarket::order_engine::{self, OrderCmd, OrderResult};
 use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
-use crate::polymarket::pm_user_ws::{self, FillEvent};
+use crate::polymarket::pm_user_ws;
 use crate::polymarket::pm_websocket;
 use crate::state::RuntimeControls;
 use crate::strategy::bankroll::{self, KellyParams, PaperEngine};
@@ -73,6 +73,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let engine_tx = live_creds.as_ref()
         .map(|c| order_engine::spawn_order_engine(c.clone(), cfg.live_armed, 8));
 
+    // User WS : une seule task ; on lui envoie le condition_id au rollover.
+    let (user_ws_cond_tx, mut user_ws_fill_rx) = live_creds.as_ref()
+        .map(|c| pm_user_ws::init_user_ws(c.clone()))
+        .map(|(tx, rx)| (Some(tx), Some(rx)))
+        .unwrap_or((None, None));
+
     let dash = dashboard::shared(cfg.dry_run);
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
@@ -117,8 +123,6 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     // Résultats en attente de l'OrderEngine.
     let mut pending_opens: Vec<PendingOpen> = Vec::new();
     let mut pending_close: Option<(oneshot::Receiver<OrderResult>, &'static str)> = None;
-    // User WS fill confirmations — lancé au premier marché détecté.
-    let mut user_ws_rx: Option<tokio::sync::watch::Receiver<Option<FillEvent>>> = None;
     let mut user_ws_condition_id: String = String::new();
 
     loop {
@@ -137,28 +141,43 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             (g.market.clone(), g.real_up, g.up_book.clone(), g.down_book.clone(), g.remaining_s)
         };
 
-        // ── 0. Spawn/relance du user WS si nouveau marché ────────────────────────────
-        if let (Some(ref m), Some(ref creds)) = (&market, &live_creds) {
+        // ── 0. Rollover user WS — notifie la task du nouveau condition_id ──────────────
+        if let Some(ref m) = market {
             if m.condition_id != user_ws_condition_id && !m.condition_id.is_empty() {
                 user_ws_condition_id = m.condition_id.clone();
-                user_ws_rx = Some(pm_user_ws::spawn_user_ws(creds.clone(), m.condition_id.clone()));
-                tracing::info!(condition_id = %m.condition_id, "pm_user_ws: lancé pour nouveau marché");
+                if let Some(ref tx) = user_ws_cond_tx {
+                    let _ = tx.send(Some(m.condition_id.clone()));
+                }
             }
         }
 
-        // Drain fills WS user — met à jour last_buy_ms/sell_ms si fill confirmé.
-        if let Some(ref mut rx) = user_ws_rx {
-            if rx.has_changed().unwrap_or(false) {
-                if let Some(fill) = rx.borrow_and_update().clone() {
+        // ── 0b. Drain fills user WS ────────────────────────────────────────────────────
+        if let Some(ref mut fill_rx) = user_ws_fill_rx {
+            if fill_rx.has_changed().unwrap_or(false) {
+                if let Some(fill) = fill_rx.borrow_and_update().clone() {
                     tracing::info!(order_id = %fill.order_id, filled = fill.filled_size,
-                        price = fill.avg_price, "✅ fill confirmé via user WS");
-                    // Réconciliation : si on a une position avec ce buy_order_id → déjà traitée.
-                    // Sinon, le fill confirme un SELL en cours.
-                    if let Some(ref pos) = live_mgr.position {
-                        if pos.buy_order_id == fill.order_id {
-                            // BUY confirmé — position déjà créée par on_buy_result.
+                        price = fill.avg_price, is_sell = fill.is_sell, "✅ fill confirmé via user WS");
+                    if fill.is_sell {
+                        // Fill SELL confirmé via WS — clôture la position si SELL en attente.
+                        if let Some((_, reason)) = pending_close.take() {
+                            live_mgr.apply_close(
+                                fill.order_id.clone(),
+                                Some(fill.filled_size),
+                                Some(fill.avg_price),
+                                reason,
+                            );
+                            // Refresh bankroll immédiat post-fill.
+                            if let (Some(creds), tx) = (live_creds.clone(), bk_tx.clone()) {
+                                tokio::spawn(async move {
+                                    if let Ok(b) = live_executor::get_collateral_balance(&creds).await {
+                                        let _ = tx.send(Some(b));
+                                    }
+                                });
+                            }
                         }
                     }
+                    // Pour un BUY, on_buy_result via oneshot POST est la source primaire ;
+                    // le fill WS sert de confirmation/réconciliation (Bloc C).
                 }
             }
         }

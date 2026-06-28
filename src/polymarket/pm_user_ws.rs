@@ -1,15 +1,16 @@
 //! WebSocket Polymarket user — confirmation des fills (Phase 4).
 //!
 //! Endpoint : `wss://ws-subscriptions-clob.polymarket.com/ws/user`
-//! Auth L2 : même HMAC que les en-têtes REST — envoyé dans le message de souscription.
-//! Subscribe : `{"markets": ["<condition_id>"], "type": "user", ...auth headers...}`
+//! Auth : `{"auth": {"apiKey": "...", "secret": "...", "passphrase": "..."}, ...}`
+//! Subscribe : `{"markets": ["<condition_id>"], "type": "user", "auth": {...}}`
 //!
 //! Events reçus :
-//! - `order`  : changement de statut d'un ordre (MATCHED → FILLED)
-//! - `trade`  : fill partiel ou total confirmé
+//! - `event_type = "trade"` : fill confirmé (taker_order_id, maker_order_id, size, price)
+//! - `event_type = "order"` UPDATE : size_matched, price
 //!
-//! Publie les fills confirmés dans un `watch::Sender<Option<FillEvent>>` que le callback
-//! `on_sell_result` dans executor.rs peut lire sans attendre.
+//! Lifecycle : une seule task lancée au boot via `init_user_ws()` ; le rollover marché
+//! envoie le nouveau `condition_id` dans le `watch::Sender<Option<String>>` → resouscrit
+//! in-session sans reconnecter.
 
 use std::time::Duration;
 
@@ -18,32 +19,43 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use super::live_executor::{build_l2_headers, LiveCredentials};
+use super::live_executor::LiveCredentials;
+use super::pm_websocket::parse_events;
 
 const PM_USER_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 const PING_INTERVAL_S: u64 = 10;
 const MAX_BACKOFF_S: u64 = 60;
 
-/// Événement de fill confirmé par le WS user.
+/// Événement de fill confirmé publié vers l'executor.
 #[derive(Debug, Clone)]
 pub struct FillEvent {
-    pub order_id: String,
+    pub order_id: String,   // l'order_id qui nous intéresse (taker ou maker)
     pub filled_size: f64,
     pub avg_price: f64,
-    pub is_taker: bool,
+    pub is_sell: bool,      // déduit via `side` dans l'event
 }
 
-/// Lance la tâche WS user en arrière-plan.
-/// Retourne un receiver que l'appelant peut surveiller à chaque tick.
-pub fn spawn_user_ws(
+/// Lance la task WS user **une fois** au boot.
+/// Retourne :
+/// - `watch::Sender<Option<String>>` : l'executor y envoie le `condition_id` du marché courant
+/// - `watch::Receiver<Option<FillEvent>>` : l'executor surveille les fills confirmés
+pub fn init_user_ws(
     creds: LiveCredentials,
-    condition_id: String,
-) -> watch::Receiver<Option<FillEvent>> {
-    let (tx, rx) = watch::channel(None::<FillEvent>);
+) -> (watch::Sender<Option<String>>, watch::Receiver<Option<FillEvent>>) {
+    let (cond_tx, mut cond_rx) = watch::channel(None::<String>);
+    let (fill_tx, fill_rx) = watch::channel(None::<FillEvent>);
+
     tokio::spawn(async move {
         let mut backoff = 1u64;
         loop {
-            match run_ws_session(&creds, &condition_id, &tx).await {
+            // Attend qu'il y ait un condition_id (clone immédiat pour libérer le guard avant await).
+            let condition_id = loop {
+                let maybe = cond_rx.borrow().clone();
+                if let Some(id) = maybe { break id; }
+                if cond_rx.changed().await.is_err() { return; }
+            };
+
+            match run_ws_session(&creds, &condition_id, &mut cond_rx, &fill_tx).await {
                 Ok(()) => tracing::info!("pm_user_ws: session terminée, reconnexion dans {backoff}s"),
                 Err(e) => tracing::warn!(error = %e, backoff, "pm_user_ws: erreur, reconnexion dans {backoff}s"),
             }
@@ -51,33 +63,20 @@ pub fn spawn_user_ws(
             backoff = (backoff * 2).min(MAX_BACKOFF_S);
         }
     });
-    rx
+
+    (cond_tx, fill_rx)
 }
 
 async fn run_ws_session(
     creds: &LiveCredentials,
-    condition_id: &str,
-    tx: &watch::Sender<Option<FillEvent>>,
+    initial_condition_id: &str,
+    cond_rx: &mut watch::Receiver<Option<String>>,
+    fill_tx: &watch::Sender<Option<FillEvent>>,
 ) -> anyhow::Result<()> {
     let (ws, _) = connect_async(PM_USER_WS_URL).await?;
     let (mut sink, mut stream) = ws.split();
 
-    // Auth L2 HMAC — timestamp courant, méthode GET, path /ws/user.
-    let ts = chrono::Utc::now().timestamp().to_string();
-    let headers = build_l2_headers(creds, &ts, "GET", "/ws/user", "")?;
-
-    let mut auth_map = serde_json::Map::new();
-    for (k, v) in &headers {
-        auth_map.insert(k.clone(), serde_json::Value::String(v.clone()));
-    }
-
-    let sub = serde_json::json!({
-        "markets": [condition_id],
-        "type": "user",
-        "auth": auth_map,
-    });
-    sink.send(Message::Text(sub.to_string())).await?;
-    tracing::info!(condition_id, "pm_user_ws: souscription user envoyée");
+    subscribe(&mut sink, creds, initial_condition_id).await?;
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_S));
     ping_interval.tick().await;
@@ -89,7 +88,7 @@ async fn run_ws_session(
                     None => return Ok(()),
                     Some(Err(e)) => return Err(e.into()),
                     Some(Ok(Message::Text(txt))) => {
-                        process_message(&txt, tx);
+                        process_message(&txt, fill_tx);
                     }
                     Some(Ok(Message::Close(_))) => return Ok(()),
                     Some(Ok(_)) => {}
@@ -98,33 +97,68 @@ async fn run_ws_session(
             _ = ping_interval.tick() => {
                 sink.send(Message::Ping(vec![])).await?;
             }
+            // Rollover : nouveau condition_id → resouscrit in-session.
+            Ok(()) = cond_rx.changed() => {
+                let new_id = cond_rx.borrow().clone();
+                if let Some(id) = new_id {
+                    tracing::info!(condition_id = %id, "pm_user_ws: resouscription rollover");
+                    subscribe(&mut sink, creds, &id).await?;
+                }
+            }
         }
     }
 }
 
-fn process_message(txt: &str, tx: &watch::Sender<Option<FillEvent>>) {
-    let events: Vec<UserEvent> = match serde_json::from_str(txt) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+async fn subscribe(
+    sink: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    creds: &LiveCredentials,
+    condition_id: &str,
+) -> anyhow::Result<()> {
+    // Auth format officiel : {apiKey, secret, passphrase} — PAS HMAC L2.
+    let sub = serde_json::json!({
+        "auth": {
+            "apiKey": creds.api_key,
+            "secret": creds.api_secret,
+            "passphrase": creds.passphrase,
+        },
+        "markets": [condition_id],
+        "type": "user",
+    });
+    tracing::info!(condition_id, "pm_user_ws: souscription user envoyée");
+    sink.send(Message::Text(sub.to_string())).await
+        .map_err(|e| anyhow::anyhow!("pm_user_ws send: {e}"))
+}
+
+fn process_message(txt: &str, fill_tx: &watch::Sender<Option<FillEvent>>) {
+    let events = parse_events::<UserEvent>(txt);
     for ev in events {
-        // On traite les `trade` events — fills confirmés par le matching engine.
-        if ev.event_type.as_deref() == Some("trade") {
-            if let (Some(order_id), Some(size_s), Some(price_s)) =
-                (&ev.order_id, &ev.size, &ev.price)
-            {
-                let filled_size: f64 = size_s.parse().unwrap_or(0.0);
-                let avg_price: f64 = price_s.parse().unwrap_or(0.0);
-                if filled_size > 0.0 && avg_price > 0.0 {
-                    tracing::info!(order_id = %order_id, filled_size, avg_price, "pm_user_ws: fill confirmé");
-                    let _ = tx.send(Some(FillEvent {
-                        order_id: order_id.clone(),
-                        filled_size,
-                        avg_price,
-                        is_taker: ev.taker_order_id.as_deref() == Some(order_id),
-                    }));
+        match ev.event_type.as_deref() {
+            Some("trade") => {
+                // Fill confirmé — on prend taker_order_id (notre ordre en général).
+                let order_id = ev.taker_order_id.or(ev.maker_order_id);
+                if let (Some(order_id), Some(size_s), Some(price_s)) =
+                    (order_id, ev.size.as_ref(), ev.price.as_ref())
+                {
+                    let filled_size: f64 = size_s.parse().unwrap_or(0.0);
+                    let avg_price: f64 = price_s.parse().unwrap_or(0.0);
+                    if filled_size > 0.0 && avg_price > 0.0 {
+                        let is_sell = ev.side.as_deref() == Some("SELL");
+                        tracing::info!(order_id = %order_id, filled_size, avg_price, is_sell,
+                            "pm_user_ws: fill confirmé");
+                        let _ = fill_tx.send(Some(FillEvent { order_id, filled_size, avg_price, is_sell }));
+                    }
                 }
             }
+            Some("order") => {
+                // UPDATE ordre : size_matched disponible, utile pour réconciliation partielle.
+                if let (Some(id), Some(matched)) = (&ev.id, &ev.size_matched) {
+                    let n: f64 = matched.parse().unwrap_or(0.0);
+                    if n > 0.0 {
+                        tracing::debug!(order_id = %id, size_matched = n, "pm_user_ws: order update");
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -133,8 +167,88 @@ fn process_message(txt: &str, tx: &watch::Sender<Option<FillEvent>>) {
 struct UserEvent {
     #[serde(rename = "type")]
     event_type: Option<String>,
-    order_id: Option<String>,
+    id: Option<String>,
     taker_order_id: Option<String>,
+    maker_order_id: Option<String>,
     size: Option<String>,
+    size_matched: Option<String>,
     price: Option<String>,
+    side: Option<String>,    // "BUY" / "SELL"
+    #[allow(dead_code)]
+    status: Option<String>,  // MATCHED / CONFIRMED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::watch;
+
+    fn make_fill_tx() -> watch::Sender<Option<FillEvent>> {
+        watch::channel(None::<FillEvent>).0
+    }
+
+    #[test]
+    fn trade_event_taker_produces_fill() {
+        let tx = make_fill_tx();
+        let mut rx = tx.subscribe();
+        let txt = serde_json::json!([{
+            "type": "trade",
+            "taker_order_id": "order-abc",
+            "maker_order_id": "order-xyz",
+            "size": "10.5",
+            "price": "0.52",
+            "side": "BUY",
+            "status": "MATCHED"
+        }]).to_string();
+        process_message(&txt, &tx);
+        let fill = rx.borrow().clone().expect("fill doit être publié");
+        assert_eq!(fill.order_id, "order-abc");
+        assert!((fill.filled_size - 10.5).abs() < 1e-9);
+        assert!((fill.avg_price - 0.52).abs() < 1e-9);
+        assert!(!fill.is_sell);
+    }
+
+    #[test]
+    fn trade_event_sell_side_sets_is_sell() {
+        let tx = make_fill_tx();
+        let mut rx = tx.subscribe();
+        let txt = serde_json::json!([{
+            "type": "trade",
+            "taker_order_id": "sell-order",
+            "size": "5.0",
+            "price": "0.48",
+            "side": "SELL",
+        }]).to_string();
+        process_message(&txt, &tx);
+        let fill = rx.borrow().clone().unwrap();
+        assert!(fill.is_sell);
+    }
+
+    #[test]
+    fn order_update_does_not_produce_fill_event() {
+        let tx = make_fill_tx();
+        let mut rx = tx.subscribe();
+        let txt = serde_json::json!([{
+            "type": "order",
+            "id": "order-abc",
+            "size_matched": "3.0",
+            "price": "0.50"
+        }]).to_string();
+        process_message(&txt, &tx);
+        assert!(rx.borrow().is_none(), "order UPDATE ne doit pas publier de FillEvent");
+    }
+
+    #[test]
+    fn trade_with_zero_size_ignored() {
+        let tx = make_fill_tx();
+        let mut rx = tx.subscribe();
+        let txt = serde_json::json!([{
+            "type": "trade",
+            "taker_order_id": "order-abc",
+            "size": "0",
+            "price": "0.50",
+        }]).to_string();
+        process_message(&txt, &tx);
+        assert!(rx.borrow().is_none());
+    }
 }
