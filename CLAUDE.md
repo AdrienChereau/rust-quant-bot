@@ -39,6 +39,7 @@ Le process et les WebSockets restent chauds. `LIVE_ARMED=true` (env) reste requi
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — topologie, hot-path, locks, isolation.
 - [docs/MATH.md](docs/MATH.md) — OBI, Black-Scholes, Kelly, TP/SL, breaker (avec refs fichier:ligne).
 - [docs/RUNBOOK.md](docs/RUNBOOK.md) — déploiement (`deploy/*.sh`), env, NTP, rollback.
+- [docs/TUTORIAL-AWS-DEBUTANT.md](docs/TUTORIAL-AWS-DEBUTANT.md) — pas-à-pas AWS+terminal pour débutant.
 - [docs/CHANGELOG.md](docs/CHANGELOG.md) — historique aligné sur les tags git.
 
 ## Rollback
