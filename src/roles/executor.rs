@@ -213,7 +213,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
         // ── 3. Live manage → OrderEngine SELL (non-bloquant) ─────────────────────────
         if pending_close.is_none() {
-            if let (Some(pos), Some(engine)) = (live_mgr.position.as_ref(), engine_tx.as_ref()) {
+            if let (Some(pos), Some(engine)) = (live_mgr.position(), engine_tx.as_ref()) {
                 if let Some(m) = &market {
                     let book = if pos.side == Side::Up { &*up_book } else { &*down_book };
                     if let Some(bid) = book.best_bid() {
@@ -283,7 +283,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         };
                         let edge = gap;
                         if is_live {
-                            if live_mgr.position.is_some() || !pending_opens.is_empty() {
+                            if live_mgr.position().is_some() || !pending_opens.is_empty() {
                                 tracing::info!(reason = "position live déjà ouverte/pending", "✗ ordre live ignoré");
                             } else {
                                 match (live_bankroll_val, engine_tx.as_ref()) {
@@ -349,7 +349,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
             d.remaining_s = remaining_s;
             d.fair_up = last_fair; d.real_up = real_up; d.gap = last_fair - real_up;
-            if let Some(p) = &live_mgr.position {
+            if let Some(p) = live_mgr.position() {
                 d.in_position = true; d.pos_side = p.side.as_str().into();
                 d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
             } else if let Some(p) = &paper.position {

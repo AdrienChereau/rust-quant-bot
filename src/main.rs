@@ -223,7 +223,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
         // Gestion de la position LIVE (symétrique).
         if let (Some(p), Some(creds), Some(m)) =
-            (live_mgr.position.as_ref(), live_creds.as_ref(), market.as_ref())
+            (live_mgr.position(), live_creds.as_ref(), market.as_ref())
         {
             let live_book = if p.side == concurrency::bus::Side::Up { &up_book } else { &down_book };
             let live_mark = live_book.best_bid();
@@ -268,7 +268,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                     if controls.is_breaker_tripped() {
                         // exécution coupée
                     } else if is_live {
-                        if live_mgr.position.is_some() {
+                        if live_mgr.position().is_some() {
                             tracing::info!(reason = "position live déjà ouverte", "✗ ordre live ignoré");
                         } else {
                             match (*live_bankroll.lock().unwrap(), live_creds.as_ref()) {
@@ -349,7 +349,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             d.cond_agreement = cond_agreement; d.cond_gap = cond_gap; d.cond_velocity = cond_velocity;
             d.cond_ready = cond_ready; d.cond_persist = cond_persist; d.all_conditions = all_conditions;
             // Position affichée : live prend la priorité si présente, sinon paper.
-            if let Some(p) = &live_mgr.position {
+            if let Some(p) = live_mgr.position() {
                 d.in_position = true;
                 d.pos_side = p.side.as_str().into(); d.pos_entry = p.entry_price; d.pos_tp = p.tp_price; d.pos_sl = p.sl_price;
             } else if let Some(p) = &paper.position {
