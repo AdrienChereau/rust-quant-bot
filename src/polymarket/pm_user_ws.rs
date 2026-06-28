@@ -74,7 +74,11 @@ async fn run_ws_session(
     fill_tx: &watch::Sender<Option<FillEvent>>,
 ) -> anyhow::Result<()> {
     tracing::info!("pm_user_ws: connexion WS user…");
-    let (ws, _) = connect_async(PM_USER_WS_URL).await?;
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(15),
+        connect_async(PM_USER_WS_URL),
+    ).await
+    .map_err(|_| anyhow::anyhow!("pm_user_ws: timeout connexion (15 s)"))??;
     tracing::info!("pm_user_ws: WS user connecté ✓");
     let (mut sink, mut stream) = ws.split();
 

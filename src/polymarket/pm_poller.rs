@@ -98,8 +98,8 @@ pub fn spawn_pm_poller(
                     g.down_book = Arc::new(dn);
                 }
             }
-            pm.lock().unwrap().remaining_s = pm.lock().unwrap().market.as_ref()
-                .map(|m| m.time_remaining_sec()).unwrap_or(0);
+            let remaining = { pm.lock().unwrap().market.as_ref().map(|m| m.time_remaining_sec()).unwrap_or(0) };
+            pm.lock().unwrap().remaining_s = remaining;
         }
     });
 }
