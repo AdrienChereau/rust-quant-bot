@@ -66,7 +66,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
     // `false` = l'exécuteur n'a pas besoin du strike (le fair arrive dans le paquet radar).
     let pm = Arc::new(Mutex::new(PmShared::default()));
-    spawn_pm_poller(pm.clone(), false);
+    spawn_pm_poller(pm.clone(), false, live_creds.clone());
 
     let lat = crate::latency::shared();
     {
@@ -292,6 +292,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             } else { None };
             d.live_shots = live_mgr.state.shots.max(live_shots);
             d.live_force_min = cfg.live_force_min_size;
+            d.lat_last_buy_ms = live_mgr.last_buy_ms;
+            d.lat_last_sell_ms = live_mgr.last_sell_ms;
         }
 
         log_throttle += 1;

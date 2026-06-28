@@ -57,6 +57,8 @@ pub struct LivePosition {
 pub struct LivePositionManager {
     pub state: LiveState,
     pub position: Option<LivePosition>,
+    pub last_buy_ms: Option<u64>,  // durée du dernier BUY POST (pour dashboard Phase 0)
+    pub last_sell_ms: Option<u64>, // durée du dernier SELL POST (pour dashboard Phase 0)
     params: KellyParams,
     state_path: String,
     trades_path: String,
@@ -81,7 +83,7 @@ impl LivePositionManager {
             .unwrap_or_default();
         tracing::info!(realized_pnl = state.realized_pnl, shots = state.shots,
             wins = state.wins, losses = state.losses, "État LIVE chargé");
-        Self { state, position: None, params, state_path, trades_path }
+        Self { state, position: None, last_buy_ms: None, last_sell_ms: None, params, state_path, trades_path }
     }
 
     /// Tente d'ouvrir une position : POST BUY FAK + enregistrement si fill > 0.
@@ -113,7 +115,8 @@ impl LivePositionManager {
         let buy_ms = t0.elapsed().as_millis();
         tracing::info!(buy_ms, side = side.as_str(), token_id, "⏱ latence BUY FAK");
         match result {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price }) => {
+            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms: buy_post_ms }) => {
+                self.last_buy_ms = Some(buy_post_ms);
                 // Fill réel ou fallback sur la taille demandée si le CLOB n'a rien exposé.
                 let entry = avg_price.unwrap_or(order_price);
                 let filled = filled_size.unwrap_or(size_final);
@@ -219,7 +222,8 @@ impl LivePositionManager {
         let sell_ms = t0.elapsed().as_millis();
         tracing::info!(sell_ms, reason, token_id = %token_id, "⏱ latence SELL FAK");
         match result {
-            Ok(PlaceResult::Placed { order_id, filled_size, avg_price }) => {
+            Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms: sell_post_ms }) => {
+                self.last_sell_ms = Some(sell_post_ms);
                 let sold = filled_size.unwrap_or(size);
                 let got_price = avg_price.unwrap_or(sell_price);
                 if sold <= 0.0 {

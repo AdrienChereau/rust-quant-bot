@@ -75,6 +75,10 @@ pub struct DashState {
     pub live_pnl: Option<f64>,      // PnL réalisé live (Δ bankroll depuis activation) — None hors live
     pub live_shots: u64,            // ordres live acceptés cette session
     pub live_force_min: bool,       // LIVE_FORCE_MIN_SIZE : taille minimale forcée (agressif)
+    // Métriques latence ordre live (ms)
+    pub lat_last_buy_ms: Option<u64>,   // BUY FAK : début POST → réponse CLOB
+    pub lat_last_sell_ms: Option<u64>,  // SELL FAK : début POST → réponse CLOB
+    pub pm_ws_stale_ms: Option<u64>,    // now − last_ws_ts_ms (Phase 2+)
 }
 
 pub type Shared = Arc<RwLock<DashState>>;

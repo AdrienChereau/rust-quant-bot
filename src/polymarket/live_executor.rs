@@ -179,6 +179,7 @@ pub enum PlaceResult {
         order_id: String,
         filled_size: Option<f64>, // tokens effectivement fillés ; None si CLOB n'a pas exposé
         avg_price: Option<f64>,   // prix moyen d'exécution ; None si CLOB n'a pas exposé
+        post_ms: u64,             // durée du POST HTTP (début → réponse CLOB)
     },
 }
 
@@ -331,7 +332,9 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
     for (k, v) in headers {
         req = req.header(k, v);
     }
+    let post_t0 = std::time::Instant::now();
     let resp = req.body(body.to_string()).send().await?;
+    let post_ms = post_t0.elapsed().as_millis() as u64;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -357,8 +360,8 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
         }
         _ => (None, None),
     };
-    tracing::warn!(order_id = %order_id, ?filled_size, ?avg_price, "✅ ordre LIVE accepté");
-    Ok(PlaceResult::Placed { order_id, filled_size, avg_price })
+    tracing::warn!(post_ms, order_id = %order_id, ?filled_size, ?avg_price, "✅ ordre LIVE accepté");
+    Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms })
 }
 
 /// Lit la **vraie collatéral USDC** du compte via le CLOB (auth L2, `signature_type`).
@@ -423,9 +426,10 @@ pub async fn startup_poly(creds: &LiveCredentials) -> anyhow::Result<()> {
             Ok(s) => { let _ = CACHED_SIGNER.set(s); }
             Err(e) => tracing::warn!(error = %e, "pré-parse signer EIP-712 échoué"),
         }
-        // Cache aussi le LocalSigner POLY_1271 si sig_type=3.
+        // Cache aussi le LocalSigner + client authentifié POLY_1271 si sig_type=3.
         if creds.sig_type == 3 {
             crate::polymarket::poly1271::init_signer(creds)?;
+            crate::polymarket::poly1271::init_auth_client(creds).await?;
         }
     }
     if creds.sig_type == 3 {

@@ -145,7 +145,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
 
     // État Polymarket, rafraîchi toutes les 1 s (hors hot-loop). `true` = on a besoin du strike.
     let pm = Arc::new(Mutex::new(PmShared::default()));
-    spawn_pm_poller(pm.clone(), true);
+    spawn_pm_poller(pm.clone(), true, live_creds.clone());
 
     // Moteurs.
     let consolidated = ConsolidatedObi::new(cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);
@@ -378,6 +378,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             } else { None };
             d.live_shots = live_mgr.state.shots.max(live_shots);
             d.live_force_min = cfg.live_force_min_size;
+            d.lat_last_buy_ms = live_mgr.last_buy_ms;
+            d.lat_last_sell_ms = live_mgr.last_sell_ms;
         }
 
         log_throttle += 1;
