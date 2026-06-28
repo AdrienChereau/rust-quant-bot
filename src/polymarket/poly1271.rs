@@ -95,6 +95,13 @@ async fn fetch_meta_for_tokens(
     Ok(map)
 }
 
+/// Supprime les métadonnées d'un token du cache (appelé sur `tick_size_change` WS).
+pub fn invalidate_token_meta(token_id: &str) {
+    if let Some(cache) = TOKEN_META.get() {
+        cache.lock().unwrap().remove(token_id);
+    }
+}
+
 /// Dérive ou crée les credentials L2 CLOB (flow L1) — à lancer en local one-shot.
 pub async fn derive_api_creds(creds: &LiveCredentials) -> anyhow::Result<Credentials> {
     let signer = local_signer(creds)?;

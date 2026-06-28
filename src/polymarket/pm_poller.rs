@@ -8,19 +8,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::relayer::{btc_price_at_window_open, Market, PolyBook, PolymarketClient};
+use super::relayer::{btc_price_at_window_open, PolymarketClient};
 use crate::polymarket::live_executor::LiveCredentials;
 
-/// État Polymarket partagé, alimenté par la tâche de polling et lu par la hot-loop.
-#[derive(Default)]
-pub struct PmShared {
-    pub market: Option<Market>,
-    pub strike: Option<f64>, // ignoré par l'exécuteur (fair reçu par UDP)
-    pub real_up: f64,
-    pub up_book: PolyBook,
-    pub down_book: PolyBook,
-    pub remaining_s: i64,
-}
+pub use super::relayer::PmShared;
 
 /// Lance la tâche de polling Polymarket en arrière-plan (1 s).
 /// `live_creds` : si fourni, `preload_token_meta` est appelé à chaque rollover marché (cache Phase 1).
@@ -43,8 +34,12 @@ pub fn spawn_pm_poller(pm: Arc<Mutex<PmShared>>, fetch_strike: bool, #[allow(unu
                             tracing::warn!(error = %e, "preload_token_meta échoué");
                         }
                     }
-                    let mut g = pm.lock().unwrap();
-                    g.market = Some(m); g.strike = strike;
+                    {
+                        let mut g = pm.lock().unwrap();
+                        g.market = Some(m); g.strike = strike;
+                    }
+                    // (Re)lance le WS carnets sur les nouveaux tokens.
+                    crate::polymarket::pm_websocket::spawn_market_ws(pm.clone());
                 }
             }
             let (up_tok, dn_tok, win) = { let g = pm.lock().unwrap();
@@ -53,11 +48,21 @@ pub fn spawn_pm_poller(pm: Arc<Mutex<PmShared>>, fetch_strike: bool, #[allow(unu
             if fetch_strike && pm.lock().unwrap().strike.is_none() {
                 if let Ok(s) = btc_price_at_window_open(win).await { pm.lock().unwrap().strike = Some(s); }
             }
+            // Fallback REST pour les carnets (remplacé par WS en Phase 2 si PM_WS_ENABLED=true).
             let up = client.get_book(&up_tok).await.ok();
             let dn = client.get_book(&dn_tok).await.ok();
             let mut g = pm.lock().unwrap();
-            if let Some(up) = up { g.real_up = up.mid().unwrap_or(g.real_up); g.up_book = up; }
-            if let Some(dn) = dn { g.down_book = dn; }
+            if let Some(up) = up {
+                g.real_up = up.mid().unwrap_or(g.real_up);
+                g.up_best_bid = up.best_bid().unwrap_or(0.0);
+                g.up_best_ask = up.best_ask().unwrap_or(1.0);
+                g.up_book = Arc::new(up);
+            }
+            if let Some(dn) = dn {
+                g.down_best_bid = dn.best_bid().unwrap_or(0.0);
+                g.down_best_ask = dn.best_ask().unwrap_or(1.0);
+                g.down_book = Arc::new(dn);
+            }
             g.remaining_s = g.market.as_ref().map(|m| m.time_remaining_sec()).unwrap_or(0);
         }
     });
