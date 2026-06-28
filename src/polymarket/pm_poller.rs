@@ -37,24 +37,32 @@ pub fn spawn_pm_poller(
             poll.tick().await;
             let need = { let g = pm.lock().unwrap(); g.market.as_ref().map_or(true, |m| m.time_remaining_sec() <= 0) };
             if need {
-                if let Ok(Some(m)) = client.get_current_btc_5m_market().await {
-                    let strike = if fetch_strike { btc_price_at_window_open(m.window_ts).await.ok() } else { None };
-                    tracing::info!(slug = %m.slug, strike = ?strike, neg_risk = m.neg_risk, "=== nouveau marché ===");
-                    // Pré-charge neg_risk+tick_size dans TOKEN_META (cache Phase 1).
-                    #[cfg(feature = "live")]
-                    if let Some(ref creds) = live_creds {
-                        let ids = [m.up_token_id.as_str(), m.down_token_id.as_str()];
-                        if let Err(e) = crate::polymarket::poly1271::preload_token_meta(creds, &ids).await {
-                            tracing::warn!(error = %e, "preload_token_meta échoué");
+                match client.get_current_btc_5m_market().await {
+                    Ok(Some(m)) => {
+                        let strike = if fetch_strike { btc_price_at_window_open(m.window_ts).await.ok() } else { None };
+                        tracing::info!(slug = %m.slug, strike = ?strike, neg_risk = m.neg_risk, "=== nouveau marché ===");
+                        // Pré-charge neg_risk+tick_size dans TOKEN_META (cache Phase 1).
+                        #[cfg(feature = "live")]
+                        if let Some(ref creds) = live_creds {
+                            let ids = [m.up_token_id.as_str(), m.down_token_id.as_str()];
+                            if let Err(e) = crate::polymarket::poly1271::preload_token_meta(creds, &ids).await {
+                                tracing::warn!(error = %e, "preload_token_meta échoué");
+                            }
                         }
+                        // Notifie le WS market des nouveaux tokens (resouscription in-session).
+                        if let Some(ref tx) = ws_tx {
+                            let tokens = vec![m.up_token_id.clone(), m.down_token_id.clone()];
+                            let _ = tx.send(tokens);
+                        }
+                        let mut g = pm.lock().unwrap();
+                        g.market = Some(m); g.strike = strike;
                     }
-                    // Notifie le WS market des nouveaux tokens (resouscription in-session).
-                    if let Some(ref tx) = ws_tx {
-                        let tokens = vec![m.up_token_id.clone(), m.down_token_id.clone()];
-                        let _ = tx.send(tokens);
+                    Ok(None) => {
+                        // Rollover gap : aucun marché actif — efface l'ancien pour éviter "fin de fenêtre" infini.
+                        tracing::info!("rollover gap : pas de marché actif, attente…");
+                        pm.lock().unwrap().market = None;
                     }
-                    let mut g = pm.lock().unwrap();
-                    g.market = Some(m); g.strike = strike;
+                    Err(e) => tracing::warn!(error = %e, "get_current_btc_5m_market échoué"),
                 }
             }
             let (up_tok, dn_tok, win, last_ws_ts_ms) = {
@@ -68,9 +76,12 @@ pub fn spawn_pm_poller(
             if fetch_strike && pm.lock().unwrap().strike.is_none() {
                 if let Ok(s) = btc_price_at_window_open(win).await { pm.lock().unwrap().strike = Some(s); }
             }
-            // Fallback REST carnets — skip si WS est récent (< 2 s).
+            // Fallback REST carnets — skip si WS est récent (< 2 s) ET real_up déjà initialisé.
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-            let ws_fresh = last_ws_ts_ms > 0 && now_ms.saturating_sub(last_ws_ts_ms) < ws_stale_threshold_ms;
+            let real_up_init = { pm.lock().unwrap().real_up };
+            let ws_fresh = last_ws_ts_ms > 0
+                && now_ms.saturating_sub(last_ws_ts_ms) < ws_stale_threshold_ms
+                && real_up_init > 0.0;
             if !ws_fresh {
                 let up = client.get_book(&up_tok).await.ok();
                 let dn = client.get_book(&dn_tok).await.ok();

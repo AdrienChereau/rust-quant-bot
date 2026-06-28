@@ -136,6 +136,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut remaining_s: i64 = 0;
     let mut is_live: bool = false;
 
+    tracing::info!("🔄 boucle principale démarrée — tick 50 ms actif");
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -359,6 +360,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
         // ── 5. Dashboard ──────────────────────────────────────────────────────────────
         let lat_snap = lat.lock().unwrap().clone();
+        // Lire pm.last_ws_ts_ms AVANT d'acquérir dash.write() pour éviter de bloquer
+        // le thread Tokio (std Mutex synchrone) pendant qu'on tient un lock async.
+        let pm_ws_stale_ms = {
+            let last = pm.lock().unwrap().last_ws_ts_ms;
+            if last > 0 { Some(now_ms.saturating_sub(last)) } else { None }
+        };
         {
             let mut d = dash.write().await;
             d.market_slug = market.as_ref().map(|m| m.slug.clone()).unwrap_or_default();
@@ -394,10 +401,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.live_force_min = cfg.live_force_min_size;
             d.lat_last_buy_ms = live_mgr.last_buy_ms;
             d.lat_last_sell_ms = live_mgr.last_sell_ms;
-            d.pm_ws_stale_ms = {
-                let last = pm.lock().unwrap().last_ws_ts_ms;
-                if last > 0 { Some(now_ms.saturating_sub(last)) } else { None }
-            };
+            d.pm_ws_stale_ms = pm_ws_stale_ms;
         }
 
         log_throttle += 1;
