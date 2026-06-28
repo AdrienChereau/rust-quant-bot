@@ -73,7 +73,9 @@ async fn run_ws_session(
     cond_rx: &mut watch::Receiver<Option<String>>,
     fill_tx: &watch::Sender<Option<FillEvent>>,
 ) -> anyhow::Result<()> {
+    tracing::info!("pm_user_ws: connexion WS user…");
     let (ws, _) = connect_async(PM_USER_WS_URL).await?;
+    tracing::info!("pm_user_ws: WS user connecté ✓");
     let (mut sink, mut stream) = ws.split();
 
     subscribe(&mut sink, creds, initial_condition_id).await?;

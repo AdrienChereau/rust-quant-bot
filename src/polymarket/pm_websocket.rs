@@ -58,7 +58,9 @@ async fn run_ws_session(
     initial_tokens: &[String],
     rx: &mut watch::Receiver<Vec<String>>,
 ) -> anyhow::Result<()> {
+    tracing::info!("pm_ws: connexion WS market…");
     let (ws, _) = connect_async(PM_WS_URL).await?;
+    tracing::info!("pm_ws: WS market connecté ✓");
     let (mut sink, mut stream) = ws.split();
 
     subscribe(&mut sink, initial_tokens).await?;

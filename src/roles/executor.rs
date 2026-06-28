@@ -232,6 +232,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         }
 
         // ── Tick 50ms ────────────────────────────────────────────────────────────────
+        if log_throttle == 0 { tracing::info!("⏰ premier tick exécuteur"); }
         now_ms = chrono::Utc::now().timestamp_millis() as u64;
         live_bankroll_val = *bk_rx.borrow();
 
