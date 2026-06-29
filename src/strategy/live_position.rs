@@ -105,6 +105,10 @@ pub struct LivePositionManager {
     pub last_sell_ms: Option<u64>,
     /// Échecs de clôture consécutifs (runtime, non persisté) — anti-boucle de SELL.
     consec_close_fails: u32,
+    /// order_id d'un BUY déjà comptabilisé via la réponse HTTP (fill taker immédiat) — on ignore
+    /// alors un éventuel fill WS du MÊME ordre (sinon double comptage). None = aucun (cas maker
+    /// resting : le fill ne vient QUE du WS, à compter normalement).
+    http_filled_buy_id: Option<String>,
     params: KellyParams,
     state_path: String,
     trades_path: String,
@@ -118,6 +122,16 @@ impl LivePositionManager {
 
     /// Aucune position ni ordre en cours → on peut tirer un nouveau signal.
     pub fn is_idle(&self) -> bool { matches!(self.phase, LivePhase::Idle) }
+
+    /// order_id du BUY qu'on suit (PendingBuy en attente OU Open déjà rempli) — pour réconcilier un
+    /// fill WS quel que soit le champ (taker/maker) où Polymarket place notre id.
+    pub fn tracked_buy_order_id(&self) -> Option<String> {
+        match &self.phase {
+            LivePhase::PendingBuy { order_id, .. } => Some(order_id.clone()),
+            LivePhase::Open(p) => Some(p.buy_order_id.clone()),
+            _ => None,
+        }
+    }
 
     /// Anti-position-coincée : un `PendingSell` sans confirmation WS après `timeout_ms` est
     /// REPASSÉ `Open` pour que la hot loop re-tente la vente. Si la vente d'origine avait en fait
@@ -182,7 +196,7 @@ impl LivePositionManager {
         tracing::info!(realized_pnl = state.realized_pnl, shots = state.shots,
             wins = state.wins, losses = state.losses, "État LIVE chargé");
         Self { phase: LivePhase::Idle, state, last_buy_ms: None, last_sell_ms: None,
-            consec_close_fails: 0, params, state_path, trades_path }
+            consec_close_fails: 0, http_filled_buy_id: None, params, state_path, trades_path }
     }
 
     /// Tente d'ouvrir une position : POST BUY FAK.
@@ -346,6 +360,9 @@ impl LivePositionManager {
                 self.last_buy_ms = Some(post_ms);
                 match filled_size {
                     Some(n) if n > 0.0 => {
+                        // Fill TAKER immédiat compté ici (HTTP). On le mémorise pour ignorer un
+                        // éventuel doublon WS du même ordre (anti-double-comptage).
+                        self.http_filled_buy_id = Some(order_id.clone());
                         let entry = avg_price.unwrap_or(order_price);
                         self.open_position(side, token_id, neg_risk, entry, n, tick, &order_id, now_ms);
                     }
@@ -460,7 +477,9 @@ impl LivePositionManager {
         }
     }
 
-    /// Confirmation WS d'un fill SELL — clôture proprement.
+    /// Confirmation WS d'un fill SELL — clôture proprement. Conservé (tests + réconciliation
+    /// future) : aujourd'hui les ventes FAK taker sont vues via la réponse HTTP (`on_sell_result`).
+    #[allow(dead_code)]
     pub fn apply_close(
         &mut self,
         order_id: String,
@@ -520,6 +539,11 @@ impl LivePositionManager {
     /// renvoyé de `filled_size`). Utilise le `neg_risk` mémorisé dans `PendingBuy`.
     pub fn on_fill_confirmed_buy(&mut self, order_id: &str, filled_size: f64, avg_price: f64, now_ms: u64) {
         if filled_size <= 0.0 { return; }
+        // Anti-double-comptage : ce fill a déjà été pris en compte via la réponse HTTP (taker-cross).
+        if self.http_filled_buy_id.as_deref() == Some(order_id) {
+            tracing::debug!(order_id, "fill BUY WS ignoré — déjà comptabilisé via HTTP");
+            return;
+        }
         match self.phase.clone() {
             LivePhase::PendingBuy { order_id: pend_id, side, token_id, neg_risk, tick, .. } => {
                 // Ne réconcilier que si le fill correspond au BUY en attente (sécurité multi-ordres).
@@ -530,30 +554,51 @@ impl LivePositionManager {
                 tracing::info!(order_id, filled_size, avg_price, "✅ PendingBuy réconcilié via user WS → Open");
                 self.open_position(side, &token_id, neg_risk, avg_price, filled_size, tick, order_id, now_ms);
             }
-            // Fill ADDITIONNEL du même GTC alors qu'on est déjà Open : un ordre resting se remplit
-            // souvent en plusieurs trades WS. On ACCUMULE (sinon le reliquat devient orphelin : la
-            // position réelle dépasse celle qu'on gère → la perte exacte qu'on veut éliminer).
-            // Sur-compter est récupérable (la vente échoue/partielle, gérée par on_sell_result) ;
-            // sous-compter ne l'est pas. On biaise donc vers l'accumulation.
-            LivePhase::Open(mut p) if order_id == p.buy_order_id => {
-                let new_size = p.size + filled_size;
-                // Prix d'entrée pondéré par les tailles cumulées.
-                p.entry_price = (p.entry_price * p.size + avg_price * filled_size) / new_size;
-                p.size = new_size;
-                let tick = if p.tick > 0.0 { p.tick } else { 0.01 };
-                p.tp_price = round_tick((p.entry_price + self.params.tp_cents / 100.0).min(0.99), tick);
-                p.sl_price = round_tick((p.entry_price - self.params.sl_cents / 100.0).max(0.01), tick);
-                tracing::warn!(order_id, add = filled_size, size = new_size,
-                    entry = format!("{:.3}", p.entry_price),
-                    "➕ fill GTC additionnel (même ordre) — position agrandie, anti-orpheline");
-                self.append("add_fill", p.side.as_str(), avg_price, filled_size, 0.0, order_id);
-                self.phase = LivePhase::Open(p);
-                self.persist();
+            // Déjà Open : le WS ne dimensionne PAS la position (il enverrait des incréments, le poll
+            // serveur envoie le cumulatif → mélanger double-compterait). La taille est calée par
+            // `reconcile_buy_to_server` (poll). Ici on ne fait rien (le poll grossira si besoin).
+            LivePhase::Open(_) if order_id == self.tracked_buy_order_id().as_deref().unwrap_or("") => {
+                tracing::debug!(order_id, "fill BUY WS sur position déjà Open — taille gérée par le poll serveur");
             }
             _ => {
                 tracing::warn!(fill = %order_id, phase = ?std::mem::discriminant(&self.phase),
                     "fill BUY WS sans PendingBuy/Open correspondant — ignoré");
             }
+        }
+    }
+
+    /// Réconciliation par PULL serveur (source de vérité, idempotente). `server_filled` = quantité
+    /// CUMULÉE réellement remplie selon le CLOB. On cale la taille suivie dessus :
+    /// - `PendingBuy` → on ADOPTE la position (le WS a pu rater le fill) ;
+    /// - `Open` (même ordre) → on GROSSIT si le serveur en voit plus (jamais on ne réduit) ;
+    /// - sinon → rien.
+    /// Idempotent : un même cumulatif re-livré ne change rien (anti-double-comptage).
+    pub fn reconcile_buy_to_server(&mut self, order_id: &str, server_filled: f64, price: f64, now_ms: u64) {
+        if server_filled <= 0.0 { return; }
+        match self.phase.clone() {
+            LivePhase::PendingBuy { order_id: pend_id, side, token_id, neg_risk, tick, .. } => {
+                if !pend_id.is_empty() && order_id != pend_id { return; }
+                tracing::warn!(order_id, server_filled, price,
+                    "🛟 fill confirmé par POLL serveur (hors WS) — adoption de la position");
+                self.open_position(side, &token_id, neg_risk, price, server_filled, tick, order_id, now_ms);
+            }
+            LivePhase::Open(mut p) if order_id == p.buy_order_id => {
+                // On ne grossit que si le serveur voit STRICTEMENT plus (tolérance dust) → idempotent.
+                if server_filled > p.size + 1e-6 {
+                    let added = server_filled - p.size;
+                    let tick = if p.tick > 0.0 { p.tick } else { 0.01 };
+                    p.entry_price = (p.entry_price * p.size + price * added) / server_filled;
+                    p.size = server_filled;
+                    p.tp_price = round_tick((p.entry_price + self.params.tp_cents / 100.0).min(0.99), tick);
+                    p.sl_price = round_tick((p.entry_price - self.params.sl_cents / 100.0).max(0.01), tick);
+                    tracing::warn!(order_id, added, size = server_filled, entry = format!("{:.3}", p.entry_price),
+                        "➕ poll serveur : position calée sur le cumulatif réel (anti-orpheline)");
+                    self.append("reconcile_grow", p.side.as_str(), price, added, 0.0, order_id);
+                    self.phase = LivePhase::Open(p);
+                    self.persist();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -598,6 +643,7 @@ impl LivePositionManager {
             realized_pnl = format!("{:.2}", self.state.realized_pnl), order_id = %order_id, "✖ clôture LIVE");
         self.phase = LivePhase::Idle;
         self.consec_close_fails = 0;
+        self.http_filled_buy_id = None;
         self.persist();
     }
 
@@ -725,32 +771,53 @@ mod tests {
     }
 
     #[test]
-    fn multi_trade_gtc_fill_accumulates_not_orphans() {
-        // Un GTC resting se remplit en 2 trades WS. Le 2ᵉ arrive en phase Open → on DOIT
-        // accumuler (taille totale = somme), sinon le reliquat est orphelin (perte silencieuse).
-        let mut m = mgr_named("multi_fill_accum");
+    fn http_filled_buy_ignores_duplicate_ws() {
+        // Taker-cross : le BUY remplit via la réponse HTTP (filled_size présent) → position ouverte.
+        // Un éventuel fill WS du MÊME ordre NE DOIT PAS re-gonfler la position (anti-double-comptage).
+        let mut m = mgr_named("http_dedup");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "x1".into(), filled_size: Some(5.0), avg_price: Some(0.24),
+                post_ms: 50 },
+            Side::Up, "tok", false, 0.30, 5.0, 0.01, 1000,
+        );
+        assert!(matches!(m.phase, LivePhase::Open(_)));
+        // Doublon WS du même order_id → ignoré.
+        m.on_fill_confirmed_buy("x1", 5.0, 0.24, 1100);
+        match &m.phase {
+            LivePhase::Open(p) => assert!((p.size - 5.0).abs() < 1e-9, "taille inchangée (pas de double), got {}", p.size),
+            other => panic!("doit rester Open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_reconcile_adopts_then_grows_idempotent() {
+        // PULL serveur = source de vérité. Un GTC resting : le poll renvoie le CUMULATIF rempli.
+        // PendingBuy → adoption ; cumulatif plus grand → on grossit ; même cumulatif re-livré →
+        // AUCUN changement (idempotent, anti-double-comptage). Sans WS du tout.
+        let mut m = mgr_named("poll_reconcile");
         m.on_buy_result(
             OrderResult::Placed { order_id: "g1".into(), filled_size: None, avg_price: None,
                 post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
-        // 1er fill partiel (6 @ 0.50) → ouvre la position.
-        m.on_fill_confirmed_buy("g1", 6.0, 0.50, 1100);
-        // 2e fill partiel du MÊME ordre (4 @ 0.52) alors qu'on est Open → doit s'accumuler.
-        m.on_fill_confirmed_buy("g1", 4.0, 0.52, 1200);
+        assert!(matches!(m.phase, LivePhase::PendingBuy { .. }));
+        // Poll : 6 remplis → adoption (Open, taille 6).
+        m.reconcile_buy_to_server("g1", 6.0, 0.50, 1100);
         match &m.phase {
-            LivePhase::Open(p) => {
-                assert!((p.size - 10.0).abs() < 1e-9, "taille cumulée doit être 10, got {}", p.size);
-                // entrée pondérée = (6*0.50 + 4*0.52)/10 = 0.508
-                assert!((p.entry_price - 0.508).abs() < 1e-9, "entry pondérée, got {}", p.entry_price);
-            }
-            other => panic!("doit rester Open, got {other:?}"),
+            LivePhase::Open(p) => assert!((p.size - 6.0).abs() < 1e-9, "adoption à 6, got {}", p.size),
+            other => panic!("doit être Open, got {other:?}"),
         }
-        // Un fill d'un AUTRE ordre ne doit pas toucher la position.
-        m.on_fill_confirmed_buy("autre", 5.0, 0.40, 1300);
+        // Poll suivant : MÊME cumulatif 6 → idempotent, pas de double.
+        m.reconcile_buy_to_server("g1", 6.0, 0.50, 1200);
+        if let LivePhase::Open(p) = &m.phase { assert!((p.size - 6.0).abs() < 1e-9, "idempotent, got {}", p.size); }
+        // Poll suivant : cumulatif 10 (le reste a rempli) → on grossit à 10 (anti-orpheline).
+        m.reconcile_buy_to_server("g1", 10.0, 0.50, 1300);
         if let LivePhase::Open(p) = &m.phase {
-            assert!((p.size - 10.0).abs() < 1e-9, "fill d'un autre ordre ignoré");
+            assert!((p.size - 10.0).abs() < 1e-9, "grossi à 10, got {}", p.size);
         } else { panic!("doit rester Open"); }
+        // Poll d'un AUTRE ordre → ignoré.
+        m.reconcile_buy_to_server("autre", 5.0, 0.40, 1400);
+        if let LivePhase::Open(p) = &m.phase { assert!((p.size - 10.0).abs() < 1e-9, "autre ordre ignoré"); }
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::concurrency::bus::Side;
 use crate::config::Config;
@@ -155,6 +155,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut down_book: Arc<PolyBook> = Arc::new(PolyBook::default());
     let mut remaining_s: i64 = 0;
     let mut last_sweep_ms: u64 = 0; // dernier balayage anti-orpheline (maker + Idle)
+    let mut last_status_poll_ms: u64 = 0; // dernier poll de statut d'ordre (PendingBuy)
+    // Réconciliation par PULL : un poll serveur (get_order_status) renvoie ici (order_id, size, price)
+    // dès qu'un ordre suivi a réellement rempli — indépendant du WebSocket (filet anti-orpheline).
+    let (recon_tx, mut recon_rx) = mpsc::unbounded_channel::<(String, f64, f64)>();
 
     tracing::info!("🔄 boucle live démarrée — tick 50 ms actif");
     loop {
@@ -296,38 +300,34 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         }
 
         // ── 0b. Drain fills user WS ────────────────────────────────────────────────────
-        // Draine TOUS les fills WS de ce tick (mpsc, pas watch : aucun fill coalescé/perdu →
-        // un fill multi-trades est entièrement réconcilié, pas d'orpheline).
+        // Draine TOUS les fills WS de ce tick (mpsc, pas watch : aucun fill coalescé/perdu).
+        // RÉCONCILIATION CORRECTE : on matche sur NOTRE order_id (taker OU maker — quand notre
+        // ordre resting se fait remplir, Polymarket met notre id dans `maker_order_id` et le `side`
+        // de l'event est celui de la contrepartie). On décide achat/vente par NOTRE phase, jamais
+        // par le côté du taker. Sans ça, un fill maker était attribué à la contrepartie → ignoré
+        // → position orpheline (le bug observé en prod).
         if let Some(ref mut fill_rx) = user_ws_fill_rx {
             while let Ok(fill) = fill_rx.try_recv() {
-                tracing::info!(order_id = %fill.order_id, filled = fill.filled_size,
-                    price = fill.avg_price, is_sell = fill.is_sell, "✅ fill confirmé via user WS");
-                if fill.is_sell {
-                    if let Some((_, reason)) = pending_close.take() {
-                        let min_os = market.as_ref().map(|m| m.min_order_size).unwrap_or(5.0);
-                        live_mgr.apply_close(
-                            fill.order_id.clone(),
-                            Some(fill.filled_size),
-                            Some(fill.avg_price),
-                            reason,
-                            min_os,
-                        );
-                        if let (Some(creds), tx) = (live_creds.clone(), bk_tx.clone()) {
-                            tokio::spawn(async move {
-                                if let Ok(b) = live_executor::get_collateral_balance(&creds).await {
-                                    let _ = tx.send(Some(b));
-                                }
-                            });
-                        }
+                if let Some(buy_id) = live_mgr.tracked_buy_order_id() {
+                    if fill.involves(&buy_id) {
+                        tracing::info!(order_id = %buy_id, filled = fill.filled_size, price = fill.avg_price,
+                            taker_sell = fill.taker_side_is_sell, "✅ fill BUY confirmé via user WS (maker/taker)");
+                        live_mgr.on_fill_confirmed_buy(&buy_id, fill.filled_size, fill.avg_price, now_ms);
+                        continue;
                     }
-                } else {
-                    // Fill BUY confirmé via WS → réconcilie PendingBuy → Open, ou accumule un
-                    // fill additionnel du même GTC si déjà Open (anti-orpheline multi-trades).
-                    live_mgr.on_fill_confirmed_buy(
-                        &fill.order_id, fill.filled_size, fill.avg_price, now_ms,
-                    );
                 }
+                // Pas notre BUY suivi. Nos VENTES sont des FAK taker → leur fill revient dans la
+                // réponse HTTP (on_sell_result), pas besoin du WS ici. On logge pour diagnostic.
+                tracing::debug!(taker = ?fill.taker_order_id, maker = ?fill.maker_order_id,
+                    filled = fill.filled_size, "fill WS sans BUY suivi correspondant — ignoré (vente gérée via HTTP)");
             }
+        }
+
+        // Réconciliation par PULL : le poll serveur a confirmé qu'un ordre suivi a rempli (le WS a
+        // pu rater le fill). On adopte la position → Open, même sans event WS. C'est LE filet qui
+        // garantit qu'on sait qu'on est rentré (et donc qu'on revend) tant qu'on tient l'order_id.
+        while let Ok((oid, server_filled, price)) = recon_rx.try_recv() {
+            live_mgr.reconcile_buy_to_server(&oid, server_filled, price, now_ms);
         }
 
         // ── 1. Drain résultats OrderEngine ────────────────────────────────────────────
@@ -357,6 +357,30 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         // ── Maker : cycle de vie SÛR d'un BUY GTC resting (anti-orpheline) ───────────────
         // RÈGLE : un fill GAGNE TOUJOURS. On n'envoie l'annulation qu'au timeout, et on ne passe
         // Idle qu'APRÈS une fenêtre de grâce SANS fill (le fill, même tardif, repasse Open via WS).
+        // PULL anti-orpheline (source de vérité SERVEUR, indépendante du WS) : tant qu'on suit un
+        // ordre d'achat (PendingBuy en attente OU Open déjà adopté), on DEMANDE toutes les ~1,5 s
+        // « combien a réellement rempli ? ». Le résultat (cumulatif) revient par recon_rx et
+        // `reconcile_buy_to_server` cale la taille suivie sur la vérité serveur (idempotent). Ainsi,
+        // même si le WS rate TOUS les events, on sait qu'on est rentré → on gère/revend la position.
+        if maker_mode && cfg.live_armed {
+            if let Some(track_id) = live_mgr.tracked_buy_order_id() {
+                if now_ms.saturating_sub(last_status_poll_ms) >= 1500 {
+                    last_status_poll_ms = now_ms;
+                    if let Some(creds) = live_creds.clone() {
+                        let tx = recon_tx.clone();
+                        tokio::spawn(async move {
+                            match live_executor::get_order_status(&creds, &track_id).await {
+                                Ok(st) if st.size_matched > 0.0 => { let _ = tx.send((track_id, st.size_matched, st.price)); }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(order_id = %track_id, error = %e,
+                                    "⚠️ poll statut ordre échoué — si ça se répète, l'endpoint /data/order est à corriger"),
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
         if maker_mode {
             if let Some((buy_id, since_ms, cancel_since)) = live_mgr.pending_buy_info() {
                 match cancel_since {

@@ -27,12 +27,25 @@ const PING_INTERVAL_S: u64 = 10;
 const MAX_BACKOFF_S: u64 = 60;
 
 /// Événement de fill confirmé publié vers l'executor.
+///
+/// On porte les DEUX order_id : quand NOTRE ordre resting (maker) se fait remplir, Polymarket met
+/// notre id dans `maker_order_id` et celui de la contrepartie dans `taker_order_id` — et le `side`
+/// de l'event est celui du TAKER (l'opposé du nôtre). L'executor matche donc sur SON order_id (peu
+/// importe le champ) et décide acheteur/vendeur par SA phase, pas par `taker_side_is_sell`.
 #[derive(Debug, Clone)]
 pub struct FillEvent {
-    pub order_id: String,   // l'order_id qui nous intéresse (taker ou maker)
+    pub taker_order_id: Option<String>,
+    pub maker_order_id: Option<String>,
     pub filled_size: f64,
     pub avg_price: f64,
-    pub is_sell: bool,      // déduit via `side` dans l'event
+    pub taker_side_is_sell: bool, // côté du TAKER (brut, pour debug/log uniquement)
+}
+
+impl FillEvent {
+    /// Vrai si `id` est l'un des deux order_id du trade (on est partie au trade, taker OU maker).
+    pub fn involves(&self, id: &str) -> bool {
+        self.taker_order_id.as_deref() == Some(id) || self.maker_order_id.as_deref() == Some(id)
+    }
 }
 
 /// Lance la task WS user **une fois** au boot.
@@ -141,18 +154,21 @@ fn process_message(txt: &str, fill_tx: &mpsc::UnboundedSender<FillEvent>) {
     for ev in events {
         match ev.event_type.as_deref() {
             Some("trade") => {
-                // Fill confirmé — on prend taker_order_id (notre ordre en général).
-                let order_id = ev.taker_order_id.or(ev.maker_order_id);
-                if let (Some(order_id), Some(size_s), Some(price_s)) =
-                    (order_id, ev.size.as_ref(), ev.price.as_ref())
-                {
+                if let (Some(size_s), Some(price_s)) = (ev.size.as_ref(), ev.price.as_ref()) {
                     let filled_size: f64 = size_s.parse().unwrap_or(0.0);
                     let avg_price: f64 = price_s.parse().unwrap_or(0.0);
                     if filled_size > 0.0 && avg_price > 0.0 {
-                        let is_sell = ev.side.as_deref() == Some("SELL");
-                        tracing::info!(order_id = %order_id, filled_size, avg_price, is_sell,
-                            "pm_user_ws: fill confirmé");
-                        let _ = fill_tx.send(FillEvent { order_id, filled_size, avg_price, is_sell });
+                        let taker_side_is_sell = ev.side.as_deref() == Some("SELL");
+                        // Log BRUT : on garde les deux id + le side tel quel pour vérifier sur un vrai
+                        // run où Polymarket place NOTRE id (taker vs maker) selon qu'on cross ou qu'on
+                        // se fait remplir en resting.
+                        tracing::info!(taker_order_id = ?ev.taker_order_id, maker_order_id = ?ev.maker_order_id,
+                            filled_size, avg_price, side = ?ev.side, "pm_user_ws: trade (brut)");
+                        let _ = fill_tx.send(FillEvent {
+                            taker_order_id: ev.taker_order_id.clone(),
+                            maker_order_id: ev.maker_order_id.clone(),
+                            filled_size, avg_price, taker_side_is_sell,
+                        });
                     }
                 }
             }
@@ -194,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn trade_event_taker_produces_fill() {
+    fn trade_event_carries_both_ids() {
         let (tx, mut rx) = make_chan();
         let txt = serde_json::json!([{
             "type": "trade",
@@ -207,25 +223,31 @@ mod tests {
         }]).to_string();
         process_message(&txt, &tx);
         let fill = rx.try_recv().expect("fill doit être publié");
-        assert_eq!(fill.order_id, "order-abc");
+        assert!(fill.involves("order-abc"), "doit matcher le taker id");
+        assert!(fill.involves("order-xyz"), "doit matcher le maker id");
+        assert!(!fill.involves("autre"));
         assert!((fill.filled_size - 10.5).abs() < 1e-9);
         assert!((fill.avg_price - 0.52).abs() < 1e-9);
-        assert!(!fill.is_sell);
     }
 
     #[test]
-    fn trade_event_sell_side_sets_is_sell() {
+    fn maker_fill_is_matchable_by_our_maker_id() {
+        // CŒUR DU FIX : notre ordre resting (maker) se fait remplir → notre id est dans
+        // `maker_order_id` et le side de l'event est SELL (côté taker). On DOIT pouvoir matcher
+        // notre id malgré tout — sinon on ignore notre propre achat (orpheline).
         let (tx, mut rx) = make_chan();
         let txt = serde_json::json!([{
             "type": "trade",
-            "taker_order_id": "sell-order",
+            "taker_order_id": "contrepartie",
+            "maker_order_id": "le-notre",
             "size": "5.0",
-            "price": "0.48",
+            "price": "0.16",
             "side": "SELL",
         }]).to_string();
         process_message(&txt, &tx);
         let fill = rx.try_recv().unwrap();
-        assert!(fill.is_sell);
+        assert!(fill.involves("le-notre"), "notre id (maker) doit matcher");
+        assert!(fill.taker_side_is_sell, "side brut = SELL (le taker a vendu)");
     }
 
     #[test]

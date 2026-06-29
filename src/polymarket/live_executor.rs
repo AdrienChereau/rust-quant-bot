@@ -400,6 +400,48 @@ async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<Place
     Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms })
 }
 
+/// Statut serveur d'un ordre (pull, indépendant du WebSocket). `size_matched` = quantité réellement
+/// remplie selon le CLOB → permet de savoir qu'on EST rentré en position même si le WS a raté le fill.
+#[derive(Debug, Clone)]
+pub struct OrderStatus {
+    pub size_matched: f64,
+    pub price: f64,
+    pub status: String, // "LIVE" | "MATCHED" | "CANCELED" | ... (brut serveur)
+}
+
+/// Interroge le CLOB pour le statut RÉEL d'un ordre par son id (`GET /data/order/{id}`, auth L2).
+/// Source de vérité serveur : on ne dépend plus du push WS pour savoir qu'un resting a rempli.
+/// Fail-safe : toute erreur (endpoint, parsing) remonte en `Err` → l'appelant garde son comportement.
+pub async fn get_order_status(creds: &LiveCredentials, order_id: &str) -> anyhow::Result<OrderStatus> {
+    let sign_path = format!("/data/order/{order_id}");
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
+    let headers = build_l2_headers(creds, &ts, "GET", &sign_path, "")?;
+    let mut req = HTTP.clone().get(format!("{CLOB_BASE}{sign_path}"));
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("CLOB /data/order {status}: {text}");
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("order status JSON '{text}': {e}"))?;
+    // Champs tolérants : le CLOB renvoie souvent les nombres en chaînes.
+    let num = |key: &str| -> f64 {
+        v.get(key)
+            .and_then(|x| x.as_str().map(|s| s.parse::<f64>().ok()).unwrap_or_else(|| x.as_f64()))
+            .unwrap_or(0.0)
+    };
+    let st = v.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let size_matched = num("size_matched");
+    let price = num("price");
+    tracing::info!(order_id, size_matched, price, status = %st, raw = %text,
+        "📡 statut ordre (poll CLOB, brut)");
+    Ok(OrderStatus { size_matched, price, status: st })
+}
+
 /// Lit la **vraie collatéral USDC** du compte via le CLOB (auth L2, `signature_type`).
 /// Read-only : sert de pré-flight d'auth (mêmes en-têtes que le POST d'ordre) ET de bankroll live.
 /// `GET /balance-allowance?asset_type=COLLATERAL&signature_type=N`.

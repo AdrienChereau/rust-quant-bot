@@ -241,7 +241,7 @@ async fn place_with_client<S: Signer>(
         anyhow::bail!("signature POLY_1271 invalide ({sig_len} car.) — rebuild avec SDK canary");
     }
     tracing::warn!(
-        order_type = "FAK",
+        order_type = match kind { OrderKind::Fak => "FAK", OrderKind::Gtc => "GTC" },
         signature_type = 3,
         signature_len = sig_len,
         "LIVE order POLY_1271 signé"
