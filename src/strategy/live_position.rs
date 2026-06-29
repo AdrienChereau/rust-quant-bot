@@ -438,6 +438,25 @@ impl LivePositionManager {
                 self.state.failed_closes += 1;
                 self.consec_close_fails += 1;
                 let no_balance = error.to_lowercase().contains("balance");
+                // Le serveur indique souvent le solde RÉEL détenu dans l'erreur ("balance: N" en base
+                // units). Si N > 0, on détient encore des tokens → ON NE DOIT PAS ABANDONNER : on
+                // recale la taille sur ce solde (anti « on vend plus qu'on a ») et on re-tentera.
+                let held_tokens = parse_balance_base_units(&error);
+                if let Some(held) = held_tokens {
+                    if held > 0.0 {
+                        if let LivePhase::Open(ref mut p) = self.phase {
+                            if p.size > held + 1e-9 {
+                                tracing::warn!(suivi = p.size, detenu = held,
+                                    "⚠️ taille suivie > solde réel — recalée sur le solde serveur (anti-oversell)");
+                                p.size = held;
+                            }
+                        }
+                        tracing::warn!(reason, detenu = held, consec = self.consec_close_fails,
+                            "❌ SELL rejeté (solde détenu > 0) — taille recalée, ré-essai (JAMAIS d'abandon tant qu'on détient)");
+                        self.persist();
+                        return;
+                    }
+                }
                 // Temps écoulé depuis l'ouverture : sous SETTLE_GRACE_MS, un `balance: 0` signifie
                 // que le BUY n'est PAS encore réglé on-chain → la position arrive, on garde et on
                 // ré-essaie (ne JAMAIS abandonner une position qu'on détient vraiment).
@@ -446,13 +465,10 @@ impl LivePositionManager {
                     _ => u64::MAX,
                 };
                 let settled = held_ms >= SETTLE_GRACE_MS;
-                // On n'abandonne une position QUE sur `no_balance` après settlement : c'est le seul
-                // signal FIABLE que la position est réellement partie (vendue à la main / réglée à
-                // l'expiration). Une erreur non-`balance` (réseau, no-match, malformé) ne prouve PAS
-                // qu'on ne détient plus rien → on RE-TENTE indéfiniment jusqu'au rollover (qui règle
-                // on-chain via resolve_expired). Abandonner sur un simple compteur d'échecs lâcherait
-                // une position encore détenue → le bot rachèterait par-dessus. JAMAIS.
-                if settled && no_balance {
+                // On n'abandonne QUE si le solde est réellement ~0 (balance: 0 OU pas de solde dans
+                // l'erreur) APRÈS settlement : seul signal fiable que la position est partie (vendue à
+                // la main / réglée à l'expiration). Sinon on re-tente jusqu'au rollover (resolve_expired).
+                if settled && no_balance && held_tokens.map_or(true, |h| h <= 0.0) {
                     tracing::error!(error = %error, reason, held_ms,
                         "🛑 position introuvable on-chain après settlement (balance=0) — phase → Idle, voir bankroll");
                     self.phase = LivePhase::Idle;
@@ -686,6 +702,19 @@ fn round_tick(p: f64, tick: f64) -> f64 {
     ((p / tick).round() * tick).clamp(0.01, 0.99)
 }
 
+/// Extrait le solde RÉEL détenu d'une erreur CLOB du type
+/// `"...the balance is not enough -> balance: 4995787, order amount: 5000000"`.
+/// Renvoie le solde en TOKENS (base units / 1e6), ou `None` si absent. Sert à recaler la taille de
+/// vente sur ce qu'on possède vraiment et à ne JAMAIS abandonner une position encore détenue.
+fn parse_balance_base_units(error: &str) -> Option<f64> {
+    let low = error.to_lowercase();
+    let idx = low.find("balance:")?;
+    let after = &error[idx + "balance:".len()..];
+    let digits: String = after.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { return None; }
+    digits.parse::<f64>().ok().map(|base| base / 1_000_000.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,6 +917,36 @@ mod tests {
         m.apply_close("o2".into(), None, None, "stop_loss", 5.0);
         assert!(!matches!(m.phase, LivePhase::Idle), "Idle sans fill = dangereux");
         let _ = fs::remove_file("/tmp/live_state_test_phase_c.json");
+    }
+
+    #[test]
+    fn parse_balance_from_clob_error() {
+        let e = "not enough balance / allowance: the balance is not enough -> balance: 4995787, order amount: 5000000";
+        let held = parse_balance_base_units(e).expect("doit parser le solde");
+        assert!((held - 4.995787).abs() < 1e-9, "solde = 4.995787 tokens, got {held}");
+        assert!(parse_balance_base_units("réseau timeout").is_none());
+        assert_eq!(parse_balance_base_units("the balance is not enough -> balance: 0, order amount: 5000000"), Some(0.0));
+    }
+
+    #[test]
+    fn oversell_resizes_position_never_abandons() {
+        // Bug prod : taille suivie (5.0) > détenu réel (4.995787) → POST rejeté "not enough balance".
+        // On DOIT recaler la position sur le solde serveur et NE PAS abandonner (sinon orpheline).
+        let mut m = mgr_named("oversell_resize");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "b1".into(), filled_size: Some(5.0), avg_price: Some(0.24),
+                post_ms: 50 },
+            Side::Down, "tok", false, 0.24, 5.0, 0.01, 1000,
+        );
+        assert!(matches!(m.phase, LivePhase::Open(_)));
+        // SELL rejeté : le serveur dit qu'on détient 4.995787 (held_ms grand = settled).
+        let err = "the balance is not enough -> balance: 4995787, order amount: 5000000".to_string();
+        m.on_sell_result(OrderResult::Failed { error: err }, "stop_loss", 60_000, 5.0);
+        match &m.phase {
+            LivePhase::Open(p) => assert!((p.size - 4.995787).abs() < 1e-6,
+                "taille recalée sur le solde réel, got {}", p.size),
+            other => panic!("doit RESTER Open (jamais abandon tant qu'on détient), got {other:?}"),
+        }
     }
 
     #[test]

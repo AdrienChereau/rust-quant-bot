@@ -156,6 +156,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut remaining_s: i64 = 0;
     let mut last_sweep_ms: u64 = 0; // dernier balayage anti-orpheline (maker + Idle)
     let mut last_status_poll_ms: u64 = 0; // dernier poll de statut d'ordre (PendingBuy)
+    let mut last_sell_attempt_ms: u64 = 0; // throttle des re-tentatives de SELL (anti-spam 50 ms)
     // Réconciliation par PULL : un poll serveur (get_order_status) renvoie ici (order_id, size, price)
     // dès qu'un ordre suivi a réellement rempli — indépendant du WebSocket (filet anti-orpheline).
     let (recon_tx, mut recon_rx) = mpsc::unbounded_channel::<(String, f64, f64)>();
@@ -456,20 +457,26 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             else if held_ms >= cfg.min_hold_sl_ms && bid <= pos.sl_price { Some("stop_loss") }
                             else if held_s >= kelly.max_hold_secs || remaining_s <= 30 { Some("max_hold") }
                             else { None };
+                        // Throttle : un SELL rejeté (ex. settlement on-chain pas fini) revient en
+                        // erreur immédiate → sans garde on re-poste toutes les 50 ms (80 ordres en
+                        // 5 s vus en prod). On limite les re-tentatives à ~1/400 ms.
                         if let Some(r) = reason {
-                            // Toutes les sorties (TP/SL/max_hold) : vendre SOUS le bid pour garantir
-                            // le fill (la FAK price-improve jusqu'aux meilleurs bids ; le buffer absorbe
-                            // le mouvement du bid pendant le round-trip). Pour un TP, bid ≥ tp donc on
-                            // encaisse quand même le profit ; vendre au prix SL exact ne matchait jamais.
-                            let exit = (bid - cfg.exit_buffer).max(0.01);
-                            let (tx, rx_r) = oneshot::channel();
-                            let cmd = OrderCmd::Close {
-                                token_id: pos.token_id.clone(), side: pos.side, neg_risk: pos.neg_risk,
-                                price: exit, size: pos.size, tick: m.tick_size, kind: OrderKind::Fak, reply: tx,
-                            };
-                            if engine.try_send(cmd).is_ok() {
-                                pending_close = Some((rx_r, r));
-                                tracing::info!(reason = r, "⚡ SELL soumis à OrderEngine");
+                            if now_ms.saturating_sub(last_sell_attempt_ms) >= 400 {
+                                last_sell_attempt_ms = now_ms;
+                                // Toutes les sorties (TP/SL/max_hold) : vendre SOUS le bid pour garantir
+                                // le fill (la FAK price-improve jusqu'aux meilleurs bids ; le buffer absorbe
+                                // le mouvement du bid pendant le round-trip). Pour un TP, bid ≥ tp donc on
+                                // encaisse quand même le profit ; vendre au prix SL exact ne matchait jamais.
+                                let exit = (bid - cfg.exit_buffer).max(0.01);
+                                let (tx, rx_r) = oneshot::channel();
+                                let cmd = OrderCmd::Close {
+                                    token_id: pos.token_id.clone(), side: pos.side, neg_risk: pos.neg_risk,
+                                    price: exit, size: pos.size, tick: m.tick_size, kind: OrderKind::Fak, reply: tx,
+                                };
+                                if engine.try_send(cmd).is_ok() {
+                                    pending_close = Some((rx_r, r));
+                                    tracing::info!(reason = r, size = pos.size, "⚡ SELL soumis à OrderEngine");
+                                }
                             }
                         }
                     }

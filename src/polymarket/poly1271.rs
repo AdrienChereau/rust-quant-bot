@@ -153,8 +153,10 @@ pub async fn place_order_poly1271(
         tracing::warn!(token_id, meta_ms, "⏱ métadonnées via fallback réseau (cache miss — lent)");
     }
 
-    let price = decimal_from_f64(args.price, price_dp, "price")?;
-    let size = decimal_from_f64(args.size, 2, "size")?; // lot max 2 décimales (SDK)
+    let price = decimal_from_f64(args.price, price_dp, false, "price")?;
+    // Taille : TRONQUÉE vers le bas (jamais arrondie au-dessus). Sinon une position de 4,995787
+    // détenue serait arrondie à 5,00 → POST rejeté "not enough balance" (on vendrait plus qu'on a).
+    let size = decimal_from_f64(args.size, 2, true, "size")?; // lot max 2 décimales (SDK)
     let _ = neg_risk_val;
     let side = if args.is_sell { Side::Sell } else { Side::Buy };
 
@@ -317,12 +319,19 @@ fn map_signature_type(sig_type: u8) -> SignatureType {
     }
 }
 
-fn decimal_from_f64(v: f64, decimal_places: u32, field: &str) -> anyhow::Result<Decimal> {
+fn decimal_from_f64(v: f64, decimal_places: u32, floor: bool, field: &str) -> anyhow::Result<Decimal> {
     if !v.is_finite() || v <= 0.0 {
         anyhow::bail!("{field} invalide: {v}");
     }
     // Évite les artefacts f64 (0.01 → 28 décimales) — le SDK rejette vs tick size.
     let d = Decimal::from_f64_retain(v)
         .ok_or_else(|| anyhow::anyhow!("{field} invalide: {v}"))?;
-    Ok(d.round_dp(decimal_places))
+    if floor {
+        // Troncature vers zéro à `decimal_places` (sans dépendre de RoundingStrategy) : on ne
+        // dépasse JAMAIS la valeur fournie. Indispensable pour la taille d'une vente.
+        let factor = Decimal::from(10u64.pow(decimal_places));
+        Ok((d * factor).trunc() / factor)
+    } else {
+        Ok(d.round_dp(decimal_places))
+    }
 }
