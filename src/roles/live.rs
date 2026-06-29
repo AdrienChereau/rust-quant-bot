@@ -317,7 +317,11 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         });
         if let Some((r, reason)) = pending_close.as_mut() {
             match r.try_recv() {
-                Ok(res) => { live_mgr.on_sell_result(res, reason, now_ms); pending_close = None; }
+                Ok(res) => {
+                    let min_os = market.as_ref().map(|m| m.min_order_size).unwrap_or(5.0);
+                    live_mgr.on_sell_result(res, reason, now_ms, min_os);
+                    pending_close = None;
+                }
                 Err(oneshot::error::TryRecvError::Empty) => {}
                 Err(_) => { pending_close = None; }
             }

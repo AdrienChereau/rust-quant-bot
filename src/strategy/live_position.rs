@@ -316,16 +316,41 @@ impl LivePositionManager {
     /// Callback SELL depuis OrderEngine. `now_ms` sert à distinguer un `balance: 0` de
     /// settlement (BUY pas encore réglé on-chain → ré-essai) d'une position vraiment disparue
     /// (fermée à la main / réglée à l'expiration → abandon).
-    pub fn on_sell_result(&mut self, res: OrderResult, reason: &str, now_ms: u64) {
+    pub fn on_sell_result(&mut self, res: OrderResult, reason: &str, now_ms: u64, min_order_size: f64) {
         match res {
             OrderResult::Placed { order_id, filled_size, avg_price, post_ms, .. } => {
                 self.last_sell_ms = Some(post_ms);
                 match filled_size {
                     Some(n) if n > 0.0 => {
                         let got = avg_price.expect("avg_price accompagne filled_size");
-                        let entry = self.position().map(|p| p.entry_price).unwrap_or(0.0);
-                        let side = self.position().map(|p| p.side.as_str()).unwrap_or("?").to_string();
-                        self.record_close(order_id, &side, n, got, entry, reason);
+                        let pos_info = if let LivePhase::Open(p) = &self.phase {
+                            Some((p.entry_price, p.side.as_str().to_string(), p.size))
+                        } else { None };
+                        match pos_info {
+                            // Fill PARTIEL re-vendable : encaisse le PnL des n vendus, réduit la
+                            // position et reste Open → la manage re-vend le reste au prochain tick.
+                            Some((entry, side, pos_size)) if pos_size - n >= min_order_size => {
+                                let pnl = (got - entry) * n;
+                                self.state.realized_pnl += pnl;
+                                self.append("close_partial", &side, got, n, pnl, &order_id);
+                                if let LivePhase::Open(ref mut p) = self.phase { p.size = pos_size - n; }
+                                self.consec_close_fails = 0;
+                                self.persist();
+                                tracing::warn!(sold = n, remaining = pos_size - n,
+                                    pnl = format!("{pnl:.2}"), "↩ SELL partiel — on re-vend le reste");
+                            }
+                            // Fill complet (ou reste < min d'échange = dust invendable) → clôture.
+                            Some((entry, side, pos_size)) => {
+                                self.record_close(order_id, &side, n, got, entry, reason);
+                                let remaining = pos_size - n;
+                                if remaining > 0.01 {
+                                    tracing::warn!(dust = remaining,
+                                        "⚠ reliquat invendable (< min d'échange) — se règle à l'expiration");
+                                }
+                            }
+                            // Phase != Open (déjà clôturée via WS ?) — best effort.
+                            None => self.record_close(order_id, "?", n, got, 0.0, reason),
+                        }
                     }
                     _ => {
                         tracing::warn!(order_id = %order_id, reason, "SELL (Engine) sans fill_size — PendingSell");
@@ -564,7 +589,7 @@ mod tests {
         m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
                 post_ms: 30 },
-            "take_profit", 1000,
+            "take_profit", 1000, 5.0,
         );
         assert!(matches!(m.phase, LivePhase::PendingSell { .. }), "doit être PendingSell, got {:?}", m.phase);
         let _ = fs::remove_file("/tmp/live_state_test_phase_c.json");
@@ -597,7 +622,7 @@ mod tests {
         m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
                 post_ms: 30 },
-            "stop_loss", 1000,
+            "stop_loss", 1000, 5.0,
         );
         // apply_close sans fill : ne doit pas clôturer.
         m.apply_close("o2".into(), None, None, "stop_loss");
