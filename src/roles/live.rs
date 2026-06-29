@@ -312,14 +312,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 if let Some(m) = &market {
                     let book = if pos.side == Side::Up { &*up_book } else { &*down_book };
                     if let Some(bid) = book.best_bid() {
-                        let held_ms = now_ms.saturating_sub(pos.opened_ms);
-                        let held_s = (held_ms / 1000) as i64;
-                        // TP : dès que la position est VENDABLE (BUY réglé on-chain, ~settlement) →
-                        //      on capture le move favorable le plus tôt possible.
-                        // SL : attend plus longtemps → ne pas bailer sur le spread d'entrée, laisser
-                        //      le mouvement prédit se produire. max_hold/expiration = sortie forcée.
-                        let reason = if held_ms >= cfg.min_hold_tp_ms && bid >= pos.tp_price { Some("take_profit") }
-                            else if held_ms >= cfg.min_hold_ms && bid <= pos.sl_price { Some("stop_loss") }
+                        let held_s = (now_ms.saturating_sub(pos.opened_ms) / 1000) as i64;
+                        let reason = if bid >= pos.tp_price { Some("take_profit") }
+                            else if bid <= pos.sl_price { Some("stop_loss") }
                             else if held_s >= kelly.max_hold_secs || remaining_s <= 30 { Some("max_hold") }
                             else { None };
                         if let Some(r) = reason {
