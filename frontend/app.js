@@ -135,12 +135,13 @@ async function refresh() {
         $("shots").textContent = `${s.shots ?? 0} (${s.wins ?? 0}/${s.losses ?? 0})`;
         $("hr").textContent = ((s.hit_rate ?? 0) * 100).toFixed(1) + "%";
         
-        // Giant PNL — nœud LIVE : PnL réel (Δ bankroll) ; nœud PAPER : PnL paper.
-        const showLivePnl = isLiveNode && s.live_pnl != null;
-        const pnlVal = showLivePnl ? s.live_pnl : s.realized_pnl;
-        $("pnl-label").textContent = showLivePnl
-          ? "REALIZED PNL — LIVE (réel, USDC)"
-          : `REALIZED PNL — PAPER ${s.maker ? "MAKER" : "TAKER"} (USDC)`;
+        // Giant PNL — le LABEL suit le TYPE DE NŒUD (pas la présence de PnL).
+        // nœud LIVE : PnL réel (Δ bankroll) ; nœud PAPER : PnL paper. Mode maker/taker affiché.
+        const execMode = s.maker ? "MAKER" : "TAKER";
+        const pnlVal = isLiveNode ? (s.live_pnl != null ? s.live_pnl : 0) : s.realized_pnl;
+        $("pnl-label").textContent = isLiveNode
+          ? `REALIZED PNL — LIVE ${execMode} (réel, USDC)`
+          : `REALIZED PNL — PAPER ${execMode} (USDC)`;
         const giantPnl = $("giant-pnl");
         giantPnl.textContent = (pnlVal >= 0 ? "+" : "") + fmt(pnlVal, 2);
         giantPnl.className = "giant-pnl " + (pnlVal > 0 ? "pos" : (pnlVal < 0 ? "neg" : ""));

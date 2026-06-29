@@ -443,6 +443,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.live_shots = live_mgr.state.shots.max(live_shots);
             d.live_force_min = cfg.live_force_min_size;
             d.fixed_order_usd = cfg.fixed_order_usd;
+            d.maker = maker_mode; // expose le mode d'exécution (maker GTC | taker FAK) au dashboard
             d.lat_last_buy_ms = live_mgr.last_buy_ms;
             d.lat_last_sell_ms = live_mgr.last_sell_ms;
             d.pm_ws_stale_ms = pm_ws_stale_ms;
