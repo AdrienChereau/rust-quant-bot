@@ -42,7 +42,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     // Mode d'exécution : taker (FAK, chemin actuel préservé) ou maker (GTC resting — en construction).
     let maker_mode = cfg.exec_mode.eq_ignore_ascii_case("maker");
     if maker_mode {
-        tracing::warn!("🧱 EXEC_MODE=maker — chemin maker GTC en construction ; bascule taker tant qu'il n'est pas câblé");
+        tracing::warn!("📐 EXEC_MODE=maker — entrée GTC au bid ACTIVE (sorties FAK ; TP-maker à venir). Plus de FAK no-match à l'entrée.");
     }
     tracing::info!(listen_port, exec_mode = %cfg.exec_mode, "🎯 LIVE (Dublin) démarré — exécution réelle");
 
