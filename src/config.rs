@@ -47,6 +47,8 @@ pub struct Config {
     pub live_armed: bool,      // LIVE_ARMED : verrou matériel pour l'envoi RÉEL d'ordres
     pub live_force_min_size: bool, // LIVE_FORCE_MIN_SIZE : ignore Kelly, force la taille minimale
                                    // (agressif — micro-test plomberie sur petite bankroll)
+    pub fixed_order_usd: f64,      // FIXED_ORDER_USD > 0 : ignore Kelly, force un notionnel fixe ($)
+                                   // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
 
     // Infrastructure live (Bloc D)
     pub pm_ws_stale_threshold_ms: u64, // skip REST book si WS < ce seuil (ms)
@@ -91,6 +93,7 @@ impl Config {
             max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
             live_armed: env_or("LIVE_ARMED", false),
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
+            fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
 
             pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),
             bankroll_poll_secs: env_or("BANKROLL_POLL_SECS", 10u64),

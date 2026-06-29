@@ -51,6 +51,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         std::env::var("STATE_PATH").unwrap_or_else(|_| "data/sniper_state.json".into()),
         std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
     );
+    paper.fixed_order_usd = cfg.fixed_order_usd;
+    if cfg.fixed_order_usd > 0.0 {
+        tracing::warn!(usd = cfg.fixed_order_usd, "⚠️ FIXED_ORDER_USD actif — Kelly ignoré (tests)");
+    }
 
     let mut rx = udp::listen(listen_port).await?;
     let mut last_fire_ms: u64 = 0;

@@ -182,7 +182,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                     (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
                                     (Some(bk), Some(engine)) => {
                                         let order_price = book.best_ask().unwrap_or(real_up);
-                                        let sized = if cfg.live_force_min_size {
+                                        let sized = if cfg.fixed_order_usd > 0.0 {
+                                            // Notionnel fixe ($) — Kelly ignoré ; plancher = min d'échange.
+                                            Some((cfg.fixed_order_usd / order_price).floor().max(m.min_order_size))
+                                        } else if cfg.live_force_min_size {
                                             Some(m.min_order_size)
                                         } else {
                                             bankroll::adjust_size_to_min(
