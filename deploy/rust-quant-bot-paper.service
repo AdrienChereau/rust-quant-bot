@@ -10,8 +10,8 @@ WorkingDirectory=/home/ubuntu/rust-quant-bot
 # Build par défaut (SANS --features live) : aucun code live n'est compilé ici.
 Environment=DRY_RUN=true
 Environment=PAPER_LISTEN_PORT=8081
-# Dashboard PAPER (PnL paper, start/stop paper).
-Environment=PORT=8768
+# Dashboard PAPER. Port 8770 (≠ radar 8768) car en option A radar+paper sont sur la même box Tokyo.
+Environment=PORT=8770
 # NE PAS figer STATE_PATH/TRADES_PATH : le code choisit automatiquement le fichier selon le mode
 # (data/sniper_state.json en taker, data/sniper_maker_state.json en MAKER_MODE) → reset propre.
 # Pour activer le maker : décommenter la ligne ci-dessous.
