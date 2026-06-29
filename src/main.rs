@@ -200,9 +200,6 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let mut live_pnl = bankroll::LivePnl::default();
     let mut was_live = false;
     let mut live_shots: u64 = 0;
-    // État de gestion gardé entre les OBI events pour que le bras Tick y accède.
-    let mut last_mark_bid: Option<f64> = None;
-    let mut last_live_pnl_val: Option<f64> = None;
 
     loop {
         let event = tokio::select! {
@@ -309,7 +306,6 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                 bk.best_bid()
             } else { None };
             paper.manage(mark_bid, now_ms, remaining_s);
-            last_mark_bid = mark_bid;
 
             // Gestion position LIVE (TP/SL/max-hold).
             if let (Some(p), Some(creds), Some(m)) =
@@ -330,7 +326,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                     None => false,
                 }
             } else {
-                bankroll::check_drawdown_breaker(paper.equity(last_mark_bid), cfg.start_cash, cfg.max_drawdown)
+                bankroll::check_drawdown_breaker(paper.equity(mark_bid), cfg.start_cash, cfg.max_drawdown)
             };
             if !controls.is_breaker_tripped() && breaker_hit && controls.trip_breaker() {
                 tracing::error!(mode = controls.mode_label(), max_dd = cfg.max_drawdown,
@@ -340,7 +336,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
             // PnL live.
             if is_live && !was_live { live_pnl.reset(); live_shots = 0; }
             was_live = is_live;
-            last_live_pnl_val = if is_live {
+            let last_live_pnl_val = if is_live {
                 live_bankroll.lock().unwrap().map(|bk| live_pnl.update(bk))
             } else { None };
 
@@ -388,7 +384,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
                 } else {
                     d.in_position = false;
                 }
-                d.cash = paper.state.cash; d.equity = paper.equity(last_mark_bid);
+                d.cash = paper.state.cash; d.equity = paper.equity(mark_bid);
                 d.realized_pnl = paper.state.realized_pnl; d.drawdown = paper.drawdown();
                 d.shots = paper.state.shots; d.wins = paper.state.wins; d.losses = paper.state.losses;
                 d.hit_rate = paper.hit_rate();

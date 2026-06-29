@@ -305,7 +305,7 @@ impl LivePositionManager {
                     }
                 }
             }
-            OrderResult::DryRun { .. } => {}
+            OrderResult::DryRun => {}
             OrderResult::Failed { error, .. } => {
                 tracing::error!(error = %error, "❌ BUY live échoué (OrderEngine)");
             }
@@ -336,7 +336,7 @@ impl LivePositionManager {
                     }
                 }
             }
-            OrderResult::DryRun { .. } => {}
+            OrderResult::DryRun => {}
             OrderResult::Failed { error, .. } => {
                 self.state.failed_closes += 1;
                 self.consec_close_fails += 1;
@@ -394,23 +394,6 @@ impl LivePositionManager {
         self.record_close(order_id, &side_str, n, got, entry, reason);
     }
 
-    /// Confirmation WS d'un fill BUY (réconciliation PendingBuy → Open).
-    pub fn on_fill_confirmed_buy(
-        &mut self,
-        order_id: &str,
-        filled_size: f64,
-        avg_price: f64,
-        now_ms: u64,
-    ) {
-        if let LivePhase::PendingBuy { ref token_id, side, tick, .. } = self.phase.clone() {
-            if filled_size > 0.0 {
-                let token = token_id.clone();
-                // neg_risk stocké dans PendingBuy n'est pas disponible ici — on suppose false (safe).
-                self.open_position(side, &token, false, avg_price, filled_size, tick, order_id, now_ms);
-            }
-        }
-    }
-
     fn open_position(
         &mut self,
         side: Side,
@@ -451,8 +434,6 @@ impl LivePositionManager {
         self.consec_close_fails = 0;
         self.persist();
     }
-
-    pub fn persist_state(&self) { self.persist(); }
 
     #[allow(dead_code)]
     pub fn hit_rate(&self) -> f64 {
@@ -518,7 +499,7 @@ mod tests {
         let mut m = mgr();
         m.on_buy_result(
             OrderResult::Placed { order_id: "o1".into(), filled_size: Some(10.0), avg_price: Some(0.50),
-                post_ms: 50, is_sell: false, reason: None },
+                post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
         assert!(matches!(m.phase, LivePhase::Open(_)));
@@ -531,7 +512,7 @@ mod tests {
         let mut m = mgr();
         m.on_buy_result(
             OrderResult::Placed { order_id: "o1".into(), filled_size: None, avg_price: None,
-                post_ms: 50, is_sell: false, reason: None },
+                post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
         // Pas de position ouverte sans fill confirmé.
@@ -546,14 +527,14 @@ mod tests {
         // Ouvre d'abord une position.
         m.on_buy_result(
             OrderResult::Placed { order_id: "o1".into(), filled_size: Some(10.0), avg_price: Some(0.50),
-                post_ms: 50, is_sell: false, reason: None },
+                post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
         assert!(matches!(m.phase, LivePhase::Open(_)));
         // SELL sans fill.
         m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
-                post_ms: 30, is_sell: true, reason: Some("take_profit") },
+                post_ms: 30 },
             "take_profit", 1000,
         );
         assert!(matches!(m.phase, LivePhase::PendingSell { .. }), "doit être PendingSell, got {:?}", m.phase);
@@ -565,7 +546,7 @@ mod tests {
         let mut m = mgr();
         m.on_buy_result(
             OrderResult::Placed { order_id: "o1".into(), filled_size: Some(10.0), avg_price: Some(0.50),
-                post_ms: 50, is_sell: false, reason: None },
+                post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
         m.apply_close("o2".into(), Some(10.0), Some(0.54), "take_profit");
@@ -580,13 +561,13 @@ mod tests {
         let mut m = mgr();
         m.on_buy_result(
             OrderResult::Placed { order_id: "o1".into(), filled_size: Some(10.0), avg_price: Some(0.50),
-                post_ms: 50, is_sell: false, reason: None },
+                post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
         // Force PendingSell.
         m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
-                post_ms: 30, is_sell: true, reason: Some("stop_loss") },
+                post_ms: 30 },
             "stop_loss", 1000,
         );
         // apply_close sans fill : ne doit pas clôturer.

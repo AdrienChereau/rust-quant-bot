@@ -31,14 +31,6 @@ pub enum WireSignal {
 }
 
 impl WireSignal {
-    /// Timestamp d'émission (ms epoch) embarqué dans le paquet.
-    pub fn sent_ms(&self) -> u64 {
-        match self {
-            WireSignal::Attack { sent_ms, .. } => *sent_ms,
-            WireSignal::Kill { sent_ms } => *sent_ms,
-        }
-    }
-
     /// Sérialise en 14 octets (Little Endian).
     pub fn to_bytes(&self) -> [u8; WIRE_LEN] {
         let mut buf = [0u8; WIRE_LEN];

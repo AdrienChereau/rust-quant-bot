@@ -19,7 +19,6 @@ pub enum OrderCmd {
         size: f64,
         tick: f64,
         min_order_size: f64,
-        now_ms: u64,
         reply: oneshot::Sender<OrderResult>,
     },
     Close {
@@ -29,7 +28,6 @@ pub enum OrderCmd {
         price: f64,
         size: f64,
         tick: f64,
-        reason: &'static str,
         reply: oneshot::Sender<OrderResult>,
     },
 }
@@ -42,11 +40,9 @@ pub enum OrderResult {
         filled_size: Option<f64>,
         avg_price: Option<f64>,
         post_ms: u64,
-        is_sell: bool,
-        reason: Option<&'static str>,  // non-None si fermeture
     },
-    DryRun { is_sell: bool },
-    Failed { error: String, is_sell: bool, reason: Option<&'static str> },
+    DryRun,
+    Failed { error: String },
 }
 
 /// Lance l'acteur en arrière-plan et renvoie le canal de commandes.
@@ -71,26 +67,26 @@ async fn execute_cmd(
     live_armed: bool,
 ) -> (OrderResult, oneshot::Sender<OrderResult>) {
     match cmd {
-        OrderCmd::Open { side, token_id, neg_risk, price, size, tick, min_order_size, now_ms: _, reply } => {
+        OrderCmd::Open { side, token_id, neg_risk, price, size, tick, min_order_size, reply } => {
             let size_final = ensure_notional(size, price, min_order_size);
             let sell_price = round_tick(price.clamp(0.01, 0.99), tick);
             let args = OrderArgs { side, price: sell_price, size: size_final, is_sell: false };
             let r = match live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args).await {
                 Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) =>
-                    OrderResult::Placed { order_id, filled_size, avg_price, post_ms, is_sell: false, reason: None },
-                Ok(PlaceResult::DryRun) => OrderResult::DryRun { is_sell: false },
-                Err(e) => OrderResult::Failed { error: e.to_string(), is_sell: false, reason: None },
+                    OrderResult::Placed { order_id, filled_size, avg_price, post_ms },
+                Ok(PlaceResult::DryRun) => OrderResult::DryRun,
+                Err(e) => OrderResult::Failed { error: e.to_string() },
             };
             (r, reply)
         }
-        OrderCmd::Close { token_id, side, neg_risk, price, size, tick, reason, reply } => {
+        OrderCmd::Close { token_id, side, neg_risk, price, size, tick, reply } => {
             let sell_price = round_tick(price.clamp(0.01, 0.99), tick);
             let args = OrderArgs { side, price: sell_price, size, is_sell: true };
             let r = match live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args).await {
                 Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) =>
-                    OrderResult::Placed { order_id, filled_size, avg_price, post_ms, is_sell: true, reason: Some(reason) },
-                Ok(PlaceResult::DryRun) => OrderResult::DryRun { is_sell: true },
-                Err(e) => OrderResult::Failed { error: e.to_string(), is_sell: true, reason: Some(reason) },
+                    OrderResult::Placed { order_id, filled_size, avg_price, post_ms },
+                Ok(PlaceResult::DryRun) => OrderResult::DryRun,
+                Err(e) => OrderResult::Failed { error: e.to_string() },
             };
             (r, reply)
         }
