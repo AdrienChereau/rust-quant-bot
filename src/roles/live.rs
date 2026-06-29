@@ -189,7 +189,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                     (None, _) => tracing::warn!("bankroll pas encore lue — tir ignoré"),
                                     (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
                                     (Some(bk), Some(engine)) => {
-                                        let order_price = book.best_ask().unwrap_or(real_up);
+                                        // Achat à ask + marge : garantit le match FAK malgré le mouvement
+                                        // du prix pendant le round-trip. La FAK price-improve → on paie
+                                        // quand même le vrai ask, la marge ne sert qu'à matcher.
+                                        let order_price = (book.best_ask().unwrap_or(real_up) + cfg.entry_buffer).min(0.99);
                                         let sized = if cfg.fixed_order_usd > 0.0 {
                                             // Notionnel fixe ($) — Kelly ignoré ; plancher = min d'échange.
                                             Some((cfg.fixed_order_usd / order_price).floor().max(m.min_order_size))
@@ -347,15 +350,11 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             else if held_s >= kelly.max_hold_secs || remaining_s <= 30 { Some("max_hold") }
                             else { None };
                         if let Some(r) = reason {
-                            // SL/max_hold : vendre SOUS le bid pour garantir le fill. Vendre au
-                            // prix SL était une contradiction (le SL se déclenche quand bid <= sl_price,
-                            // donc un SELL limite à sl_price ne trouvait jamais d'acheteur → boucle).
-                            // La FAK price-improve jusqu'aux meilleurs bids ; le buffer absorbe le
-                            // mouvement du bid pendant le transit.
-                            let exit = match r {
-                                "take_profit" => pos.tp_price,
-                                _ => (bid - cfg.exit_buffer).max(0.01),
-                            };
+                            // Toutes les sorties (TP/SL/max_hold) : vendre SOUS le bid pour garantir
+                            // le fill (la FAK price-improve jusqu'aux meilleurs bids ; le buffer absorbe
+                            // le mouvement du bid pendant le round-trip). Pour un TP, bid ≥ tp donc on
+                            // encaisse quand même le profit ; vendre au prix SL exact ne matchait jamais.
+                            let exit = (bid - cfg.exit_buffer).max(0.01);
                             let (tx, rx_r) = oneshot::channel();
                             let cmd = OrderCmd::Close {
                                 token_id: pos.token_id.clone(), side: pos.side, neg_risk: pos.neg_risk,

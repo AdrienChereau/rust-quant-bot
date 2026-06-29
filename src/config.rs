@@ -58,8 +58,10 @@ pub struct Config {
                                    // (agressif — micro-test plomberie sur petite bankroll)
     pub fixed_order_usd: f64,      // FIXED_ORDER_USD > 0 : ignore Kelly, force un notionnel fixe ($)
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
-    pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties SL/max_hold
-                                   // (garantit le fill de la vente ; la FAK price-improve).
+    pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties (garantit le
+                                   // fill de la vente ; la FAK price-improve).
+    pub entry_buffer: f64,         // ENTRY_BUFFER : marge AU-DESSUS de l'ask pour l'achat (garantit
+                                   // le fill du BUY malgré le mouvement du prix pendant le round-trip).
     pub min_hold_sl_ms: u64,       // MIN_HOLD_SL_MS : délai avant que le SL puisse se déclencher
                                    // (évite le SL instantané sur le spread d'entrée). TP non concerné.
 
@@ -115,6 +117,7 @@ impl Config {
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
+            entry_buffer: env_or("ENTRY_BUFFER", 0.02),
             min_hold_sl_ms: env_or("MIN_HOLD_SL_MS", 500u64),
 
             pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),
