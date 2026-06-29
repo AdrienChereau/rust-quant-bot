@@ -128,6 +128,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     // Latence pipeline (mise à jour au dernier ordre soumis).
     let mut last_transport_ms: Option<u64> = None; // radar→live (NTP)
     let mut last_decide_ms: Option<u64> = None;     // recv UDP → try_send (mono-horloge)
+    let mut last_pos_bid: Option<f64> = None;       // dernier bid observé du token de la position (résolution au rollover)
 
     // Snapshot hoissé pour traitement immédiat du signal UDP (Bloc E).
     let mut now_ms: u64 = 0;
@@ -321,10 +322,21 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
 
         // ── 2. Live manage → OrderEngine SELL (non-bloquant) ─────────────────────────
         if pending_close.is_none() {
-            if let (Some(pos), Some(engine)) = (live_mgr.position(), engine_tx.as_ref()) {
+            if let (Some(pos), Some(engine)) = (live_mgr.position().cloned(), engine_tx.as_ref()) {
                 if let Some(m) = &market {
+                    // ── Rollover : la fenêtre 5 min a changé → le token de la position n'est plus
+                    // l'actif tradable. On NE trade PAS le carnet du nouveau marché (sinon faux "TP"
+                    // sur le mauvais token) : la position est réglée on-chain (gagnée/perdue).
+                    let current_token = if pos.side == Side::Up { &m.up_token_id } else { &m.down_token_id };
+                    if pos.token_id != *current_token {
+                        tracing::warn!(pos_token = %pos.token_id, slug = %m.slug,
+                            "🪙 fenêtre tournée — position réglée à l'expiration (pas de TP sur le marché suivant)");
+                        live_mgr.resolve_expired(last_pos_bid.unwrap_or(0.0));
+                        last_pos_bid = None;
+                    } else {
                     let book = if pos.side == Side::Up { &*up_book } else { &*down_book };
                     if let Some(bid) = book.best_bid() {
+                        last_pos_bid = Some(bid);
                         let held_ms = now_ms.saturating_sub(pos.opened_ms);
                         let held_s = (held_ms / 1000) as i64;
                         // TP : immédiat (on encaisse un move favorable dès qu'il arrive).
@@ -355,6 +367,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    } // fin else (token de la position toujours actif)
                 }
             }
         }

@@ -395,6 +395,16 @@ impl LivePositionManager {
         self.record_close(order_id, &side_str, n, got, entry, reason);
     }
 
+    /// La fenêtre 5 min a expiré (rollover) : le token de la position n'est plus tradable, la
+    /// position est réglée on-chain. On la clôture au dernier prix observé (`mark_price`, estimation ;
+    /// la bankroll réelle fait foi). Évite le faux "TP" sur le token du marché suivant.
+    pub fn resolve_expired(&mut self, mark_price: f64) {
+        if let LivePhase::Open(p) = self.phase.clone() {
+            let mark = mark_price.clamp(0.0, 1.0);
+            self.record_close(p.buy_order_id.clone(), p.side.as_str(), p.size, mark, p.entry_price, "expired");
+        }
+    }
+
     /// Confirmation WS d'un fill BUY → réconcilie `PendingBuy → Open` (le POST n'avait pas
     /// renvoyé de `filled_size`). Utilise le `neg_risk` mémorisé dans `PendingBuy`.
     pub fn on_fill_confirmed_buy(&mut self, order_id: &str, filled_size: f64, avg_price: f64, now_ms: u64) {
@@ -442,7 +452,10 @@ impl LivePositionManager {
         let pnl = (got_price - entry) * sold;
         self.state.realized_pnl += pnl;
         if pnl >= 0.0 { self.state.wins += 1 } else { self.state.losses += 1 }
-        let kind = match reason { "take_profit" => "close_tp", "stop_loss" => "close_sl", _ => "close_max_hold" };
+        let kind = match reason {
+            "take_profit" => "close_tp", "stop_loss" => "close_sl",
+            "expired" => "close_expired", _ => "close_max_hold",
+        };
         self.append(kind, side, got_price, sold, pnl, &order_id);
         tracing::warn!(reason, exit = format!("{got_price:.3}"), pnl = format!("{pnl:.2}"),
             realized_pnl = format!("{:.2}", self.state.realized_pnl), order_id = %order_id, "✖ clôture LIVE");
