@@ -281,6 +281,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                 });
                             }
                         }
+                    } else {
+                        // Fill BUY confirmé via WS → réconcilie une éventuelle position PendingBuy
+                        // (le POST n'avait pas renvoyé de filled_size). Sans effet si phase != PendingBuy.
+                        live_mgr.on_fill_confirmed_buy(
+                            &fill.order_id, fill.filled_size, fill.avg_price, now_ms,
+                        );
                     }
                 }
             }

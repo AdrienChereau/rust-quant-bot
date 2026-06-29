@@ -70,6 +70,7 @@ pub enum LivePhase {
         order_id: String,
         side: Side,
         token_id: String,
+        neg_risk: bool,
         requested_size: f64,
         tick: f64,
         since_ms: u64,
@@ -168,7 +169,7 @@ impl LivePositionManager {
                         // filled_size absent ou nul → PendingBuy, attend confirmation WS.
                         tracing::warn!(order_id = %order_id, "BUY accepté sans fill_size — PendingBuy");
                         self.phase = LivePhase::PendingBuy {
-                            order_id, side, token_id: token_id.to_string(),
+                            order_id, side, token_id: token_id.to_string(), neg_risk,
                             requested_size: size_final, tick, since_ms: now_ms,
                         };
                     }
@@ -299,7 +300,7 @@ impl LivePositionManager {
                     _ => {
                         tracing::warn!(order_id = %order_id, "BUY (Engine) sans fill_size — PendingBuy");
                         self.phase = LivePhase::PendingBuy {
-                            order_id, side, token_id: token_id.to_string(),
+                            order_id, side, token_id: token_id.to_string(), neg_risk,
                             requested_size: _size, tick, since_ms: now_ms,
                         };
                     }
@@ -392,6 +393,21 @@ impl LivePositionManager {
         };
         let got = avg_price.unwrap_or(0.0);
         self.record_close(order_id, &side_str, n, got, entry, reason);
+    }
+
+    /// Confirmation WS d'un fill BUY → réconcilie `PendingBuy → Open` (le POST n'avait pas
+    /// renvoyé de `filled_size`). Utilise le `neg_risk` mémorisé dans `PendingBuy`.
+    pub fn on_fill_confirmed_buy(&mut self, order_id: &str, filled_size: f64, avg_price: f64, now_ms: u64) {
+        let LivePhase::PendingBuy { order_id: pend_id, side, token_id, neg_risk, tick, .. } = self.phase.clone()
+        else { return };
+        if filled_size <= 0.0 { return; }
+        // Ne réconcilier que si le fill correspond au BUY en attente (sécurité multi-ordres).
+        if !pend_id.is_empty() && order_id != pend_id {
+            tracing::warn!(fill = %order_id, pending = %pend_id, "fill BUY WS d'un autre ordre — ignoré");
+            return;
+        }
+        tracing::info!(order_id, filled_size, avg_price, "✅ PendingBuy réconcilié via user WS → Open");
+        self.open_position(side, &token_id, neg_risk, avg_price, filled_size, tick, order_id, now_ms);
     }
 
     fn open_position(
