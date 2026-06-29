@@ -156,8 +156,17 @@ impl PaperEngine {
         });
         self.state.shots += 1;
         self.append("fire", side.as_str(), avg_price, filled, 0.0);
-        tracing::warn!(side = side.as_str(), token_id, entry = format!("{:.3}", avg_price),
-            size = filled, tp = format!("{:.2}", tp), "🎯 SNIPE");
+        // Log VÉRIFIABLE : en maker `entry == bid` (on a capté le spread) ; en taker `entry ≈ ask`.
+        let best_bid = book.best_bid().unwrap_or(0.0);
+        tracing::warn!(
+            mode = if self.maker { "MAKER" } else { "TAKER" },
+            side = side.as_str(),
+            entry = format!("{:.3}", avg_price),
+            bid = format!("{:.3}", best_bid),
+            ask = format!("{:.3}", best_ask),
+            spread = format!("{:.3}", best_ask - best_bid),
+            size = filled, tp = format!("{:.2}", tp),
+            "🎯 SNIPE");
         true
     }
 
