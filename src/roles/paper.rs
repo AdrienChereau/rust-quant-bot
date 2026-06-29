@@ -46,10 +46,17 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         kelly_fraction: cfg.kelly_fraction, max_size_pct: cfg.max_kelly_size_pct,
         tp_cents: cfg.take_profit_cents, sl_cents: cfg.stop_loss_cents, max_hold_secs: cfg.max_hold_secs,
     };
+    // Fichiers d'état SÉPARÉS selon le mode → le maker démarre frais sans écraser l'historique
+    // taker (et inversement). On ne supprime jamais un fichier d'état (règle never-delete-data).
+    let (def_state, def_trades) = if cfg.maker_mode {
+        ("data/sniper_maker_state.json", "data/sniper_maker_trades.jsonl")
+    } else {
+        ("data/sniper_state.json", "data/sniper_trades.jsonl")
+    };
     let mut paper = PaperEngine::load_or_init(
         cfg.start_cash, kelly,
-        std::env::var("STATE_PATH").unwrap_or_else(|_| "data/sniper_state.json".into()),
-        std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
+        std::env::var("STATE_PATH").unwrap_or_else(|_| def_state.into()),
+        std::env::var("TRADES_PATH").unwrap_or_else(|_| def_trades.into()),
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
     paper.maker = cfg.maker_mode;
