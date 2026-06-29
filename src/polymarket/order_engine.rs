@@ -7,7 +7,7 @@
 use tokio::sync::{mpsc, oneshot};
 
 use crate::concurrency::bus::Side;
-use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs, PlaceResult};
+use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs, OrderKind, PlaceResult};
 
 /// Commande envoyée à l'acteur OrderEngine.
 pub enum OrderCmd {
@@ -19,6 +19,7 @@ pub enum OrderCmd {
         size: f64,
         tick: f64,
         min_order_size: f64,
+        kind: OrderKind,   // Fak (taker) | Gtc (maker resting)
         reply: oneshot::Sender<OrderResult>,
     },
     Close {
@@ -28,6 +29,13 @@ pub enum OrderCmd {
         price: f64,
         size: f64,
         tick: f64,
+        kind: OrderKind,   // Fak (SL taker) | Gtc (TP maker)
+        reply: oneshot::Sender<OrderResult>,
+    },
+    /// Annule un ordre resting (GTC) par son order_id. (câblé au cycle de vie maker, Step 2)
+    #[allow(dead_code)]
+    Cancel {
+        order_id: String,
         reply: oneshot::Sender<OrderResult>,
     },
 }
@@ -42,6 +50,8 @@ pub enum OrderResult {
         post_ms: u64,
     },
     DryRun,
+    #[allow(dead_code)] // order_id lu par le hot loop maker (Step 2)
+    Cancelled { order_id: String },
     Failed { error: String },
 }
 
@@ -67,11 +77,11 @@ async fn execute_cmd(
     live_armed: bool,
 ) -> (OrderResult, oneshot::Sender<OrderResult>) {
     match cmd {
-        OrderCmd::Open { side, token_id, neg_risk, price, size, tick, min_order_size, reply } => {
+        OrderCmd::Open { side, token_id, neg_risk, price, size, tick, min_order_size, kind, reply } => {
             let size_final = ensure_notional(size, price, min_order_size);
             let sell_price = round_tick(price.clamp(0.01, 0.99), tick);
             let args = OrderArgs { side, price: sell_price, size: size_final, is_sell: false };
-            let r = match live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args).await {
+            let r = match live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args, kind).await {
                 Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) =>
                     OrderResult::Placed { order_id, filled_size, avg_price, post_ms },
                 Ok(PlaceResult::DryRun) => OrderResult::DryRun,
@@ -79,13 +89,20 @@ async fn execute_cmd(
             };
             (r, reply)
         }
-        OrderCmd::Close { token_id, side, neg_risk, price, size, tick, reply } => {
+        OrderCmd::Close { token_id, side, neg_risk, price, size, tick, kind, reply } => {
             let sell_price = round_tick(price.clamp(0.01, 0.99), tick);
             let args = OrderArgs { side, price: sell_price, size, is_sell: true };
-            let r = match live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args).await {
+            let r = match live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args, kind).await {
                 Ok(PlaceResult::Placed { order_id, filled_size, avg_price, post_ms }) =>
                     OrderResult::Placed { order_id, filled_size, avg_price, post_ms },
                 Ok(PlaceResult::DryRun) => OrderResult::DryRun,
+                Err(e) => OrderResult::Failed { error: e.to_string() },
+            };
+            (r, reply)
+        }
+        OrderCmd::Cancel { order_id, reply } => {
+            let r = match live_executor::cancel_order(creds, &order_id).await {
+                Ok(()) => OrderResult::Cancelled { order_id },
                 Err(e) => OrderResult::Failed { error: e.to_string() },
             };
             (r, reply)

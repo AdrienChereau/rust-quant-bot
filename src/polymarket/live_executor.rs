@@ -43,7 +43,8 @@ static CACHED_SIGNER: std::sync::OnceLock<alloy::signers::local::PrivateKeySigne
 static CACHED_HMAC_KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
 pub(crate) const CLOB_BASE: &str = "https://clob.polymarket.com";
-const ORDER_TYPE_FAK: &str = "FAK"; // Fill-And-Kill — JAMAIS FOK.
+const ORDER_TYPE_FAK: &str = "FAK"; // Fill-And-Kill — taker.
+const ORDER_TYPE_GTC: &str = "GTC"; // Good-Till-Cancel — maker (dort dans le carnet).
 
 // EIP-712 domain Polymarket (Polygon, chainId 137). verifyingContract dépend du type de marché :
 // CTF Exchange standard vs. NegRisk CTF Exchange. Le mauvais contrat → signature invalide (rejet).
@@ -173,6 +174,11 @@ pub struct OrderArgs {
     pub is_sell: bool, // false = BUY (entry), true = SELL (exit)
 }
 
+/// Type d'exécution, représentation NEUTRE (sans dépendance SDK, donc compile en build par défaut).
+/// `Fak` = Fill-And-Kill (taker, chemin actuel). `Gtc` = Good-Till-Cancel (maker, dort dans le carnet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderKind { Fak, Gtc }
+
 /// Résultat d'une tentative de placement. Pour un fill réel, on renvoie aussi la taille fillée
 /// et le prix moyen quand le CLOB les expose (sinon `None` → l'appelant doit fallback).
 #[derive(Debug, PartialEq)]
@@ -297,6 +303,7 @@ pub async fn place_order(
     token_id: &str,
     neg_risk: bool,
     args: OrderArgs,
+    kind: OrderKind,
 ) -> anyhow::Result<PlaceResult> {
     let Some(creds) = creds else {
         tracing::warn!(?args, token_id, "LIVE — pas de credentials POLY_*, ordre ignoré");
@@ -306,25 +313,37 @@ pub async fn place_order(
     if creds.sig_type == 3 {
         // POLY_1271 : le SDK V2 résout neg-risk en interne (cf. poly1271.rs).
         #[cfg(feature = "live")]
-        return crate::polymarket::poly1271::place_order_poly1271(live_armed, creds, token_id, args).await;
+        return crate::polymarket::poly1271::place_order_poly1271(live_armed, creds, token_id, args, kind).await;
         #[cfg(not(feature = "live"))]
-        anyhow::bail!("sig_type=3 (POLY_1271) requiert `cargo build --features live`");
+        { let _ = kind; anyhow::bail!("sig_type=3 (POLY_1271) requiert `cargo build --features live`"); }
     }
 
+    let order_type = match kind { OrderKind::Fak => ORDER_TYPE_FAK, OrderKind::Gtc => ORDER_TYPE_GTC };
     let fields = OrderFields::build(token_id, args, creds);
     let signature = sign_order_eip712(&fields, neg_risk, &creds.private_key)?;
     let req = PlaceRequest {
         order: OrderJson::from_fields(&fields, signature),
         owner: creds.api_key.clone(),
-        order_type: ORDER_TYPE_FAK.into(),
+        order_type: order_type.into(),
     };
     let json = serde_json::to_string(&req)?;
-    tracing::warn!(order_type = ORDER_TYPE_FAK, request = %json, "LIVE order signé");
+    tracing::warn!(order_type, request = %json, "LIVE order signé");
 
     if !live_armed {
         return Ok(PlaceResult::DryRun); // Dry-Run Live : signé + loggé, NON envoyé.
     }
     post_order(creds, &json).await
+}
+
+/// Annule un ordre resting (GTC) par son `order_id`. sig_type=3 → SDK V2 (`poly1271::cancel`).
+pub async fn cancel_order(creds: &LiveCredentials, order_id: &str) -> anyhow::Result<()> {
+    if creds.sig_type == 3 {
+        #[cfg(feature = "live")]
+        return crate::polymarket::poly1271::cancel_order_poly1271(creds, order_id).await;
+        #[cfg(not(feature = "live"))]
+        { let _ = order_id; anyhow::bail!("cancel sig_type=3 requiert `cargo build --features live`"); }
+    }
+    anyhow::bail!("cancel hors sig_type=3 non implémenté (REST manuel à ajouter si besoin)")
 }
 
 /// POST réel `/order` avec en-têtes L2 HMAC. Atteint seulement si `live_armed` ET signé.

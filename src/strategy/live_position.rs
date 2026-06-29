@@ -24,7 +24,7 @@ use std::io::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::concurrency::bus::Side;
-use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs, PlaceResult};
+use crate::polymarket::live_executor::{self, LiveCredentials, OrderArgs, OrderKind, PlaceResult};
 use crate::polymarket::order_engine::OrderResult;
 use crate::polymarket::relayer::PolyBook;
 use crate::strategy::bankroll::KellyParams;
@@ -154,7 +154,7 @@ impl LivePositionManager {
         let size_final = size.max(size_min_cost);
         let args = OrderArgs { side, price: order_price, size: size_final, is_sell: false };
         let t0 = tokio::time::Instant::now();
-        let result = live_executor::place_order(live_armed, Some(creds), token_id, neg_risk, args).await;
+        let result = live_executor::place_order(live_armed, Some(creds), token_id, neg_risk, args, OrderKind::Fak).await;
         let buy_ms = t0.elapsed().as_millis() as u64;
         tracing::info!(buy_ms, side = side.as_str(), token_id, "⏱ latence BUY FAK");
         match result {
@@ -240,7 +240,7 @@ impl LivePositionManager {
         let _ = min_order_size;
         let args = OrderArgs { side, price: sell_price, size, is_sell: true };
         let t0 = tokio::time::Instant::now();
-        let result = live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args).await;
+        let result = live_executor::place_order(live_armed, Some(creds), &token_id, neg_risk, args, OrderKind::Fak).await;
         let sell_ms = t0.elapsed().as_millis() as u64;
         tracing::info!(sell_ms, reason, token_id = %token_id, "⏱ latence SELL FAK");
         match result {
@@ -307,6 +307,7 @@ impl LivePositionManager {
                 }
             }
             OrderResult::DryRun => {}
+            OrderResult::Cancelled { .. } => {} // géré côté hot loop, pas ici
             OrderResult::Failed { error, .. } => {
                 tracing::error!(error = %error, "❌ BUY live échoué (OrderEngine)");
             }
@@ -363,6 +364,7 @@ impl LivePositionManager {
                 }
             }
             OrderResult::DryRun => {}
+            OrderResult::Cancelled { .. } => {} // géré côté hot loop, pas ici
             OrderResult::Failed { error, .. } => {
                 self.state.failed_closes += 1;
                 self.consec_close_fails += 1;

@@ -11,7 +11,7 @@ use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::{POLYGON};
 
-use super::live_executor::{LiveCredentials, OrderArgs, PlaceResult, CLOB_BASE};
+use super::live_executor::{LiveCredentials, OrderArgs, OrderKind, PlaceResult, CLOB_BASE};
 
 // ─── Caches pré-chargés au démarrage (startup_poly) ────────────────────────────────────────────
 
@@ -122,6 +122,7 @@ pub async fn place_order_poly1271(
     creds: &LiveCredentials,
     token_id: &str,
     args: OrderArgs,
+    kind: OrderKind,
 ) -> anyhow::Result<PlaceResult> {
     let signer = local_signer(creds)?;
     let token = U256::from_str(token_id).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
@@ -160,12 +161,26 @@ pub async fn place_order_poly1271(
     // Client caché (init au démarrage) ou temporaire si absent.
     if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
         let client = cache_lock.lock().await;
-        place_with_client(&*client, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms).await
+        place_with_client(&*client, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms, kind).await
     } else {
         tracing::warn!("CACHED_AUTH_CLIENT absent — authenticate() per-ordre (lent)");
         let client_tmp = authenticated_client(creds, &signer).await?;
-        place_with_client(&client_tmp, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms).await
+        place_with_client(&client_tmp, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms, kind).await
     }
+}
+
+/// Annule un ordre resting (GTC) par son `order_id` via le SDK V2 (`client.cancel_order`).
+pub async fn cancel_order_poly1271(creds: &LiveCredentials, order_id: &str) -> anyhow::Result<()> {
+    if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
+        let client = cache_lock.lock().await;
+        client.cancel_order(order_id).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else {
+        let signer = local_signer(creds)?;
+        let client = authenticated_client(creds, &signer).await?;
+        client.cancel_order(order_id).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    tracing::info!(order_id, "🗑 ordre GTC annulé (SDK)");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,7 +194,9 @@ async fn place_with_client<S: Signer>(
     live_armed: bool,
     is_sell: bool,
     meta_ms: u64,
+    kind: OrderKind,
 ) -> anyhow::Result<PlaceResult> {
+    let order_type = match kind { OrderKind::Fak => OrderType::FAK, OrderKind::Gtc => OrderType::GTC };
     let build_t0 = std::time::Instant::now();
     let signable = client
         .limit_order()
@@ -187,7 +204,7 @@ async fn place_with_client<S: Signer>(
         .side(side)
         .price(price)
         .size(size)
-        .order_type(OrderType::FAK)
+        .order_type(order_type)
         .build()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

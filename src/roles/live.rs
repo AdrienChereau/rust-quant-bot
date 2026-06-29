@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::dashboard;
 use crate::net::udp;
 use crate::net::wire::WireSignal;
-use crate::polymarket::live_executor::{self, LiveCredentials};
+use crate::polymarket::live_executor::{self, LiveCredentials, OrderKind};
 use crate::polymarket::order_engine::{self, OrderCmd, OrderResult};
 use crate::polymarket::pm_poller::{spawn_pm_poller, PmShared};
 use crate::polymarket::relayer::{Market, PolyBook};
@@ -223,7 +223,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                                 let cmd = OrderCmd::Open {
                                                     side, token_id: token.clone(), neg_risk: m.neg_risk,
                                                     price: order_price, size, tick: m.tick_size,
-                                                    min_order_size: m.min_order_size, reply: tx,
+                                                    min_order_size: m.min_order_size, kind: OrderKind::Fak, reply: tx,
                                                 };
                                                 if engine.try_send(cmd).is_ok() {
                                                     pending_opens.push(PendingOpen {
@@ -367,7 +367,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             let (tx, rx_r) = oneshot::channel();
                             let cmd = OrderCmd::Close {
                                 token_id: pos.token_id.clone(), side: pos.side, neg_risk: pos.neg_risk,
-                                price: exit, size: pos.size, tick: m.tick_size, reply: tx,
+                                price: exit, size: pos.size, tick: m.tick_size, kind: OrderKind::Fak, reply: tx,
                             };
                             if engine.try_send(cmd).is_ok() {
                                 pending_close = Some((rx_r, r));

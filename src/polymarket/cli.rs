@@ -69,7 +69,7 @@ async fn dry_order(token_id: &str, price: f64, size: f64, neg_risk: bool) -> any
     let creds = LiveCredentials::from_env()
         .ok_or_else(|| anyhow::anyhow!("identifiants POLY_* incomplets"))?;
     let args = OrderArgs { side: Side::Up, price, size, is_sell: false };
-    let result = live_executor::place_order(false, Some(&creds), token_id, neg_risk, args).await?;
+    let result = live_executor::place_order(false, Some(&creds), token_id, neg_risk, args, live_executor::OrderKind::Fak).await?;
     match result {
         live_executor::PlaceResult::DryRun => println!("Dry-run OK — ordre signé, non POSTé"),
         live_executor::PlaceResult::Placed { order_id, .. } => println!("Ordre accepté : {order_id}"),
