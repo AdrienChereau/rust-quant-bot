@@ -12,8 +12,10 @@ Environment=DRY_RUN=true
 Environment=PAPER_LISTEN_PORT=8081
 # Dashboard PAPER (PnL paper, start/stop paper).
 Environment=PORT=8768
-Environment=STATE_PATH=/home/ubuntu/rust-quant-bot/data/sniper_state.json
-Environment=TRADES_PATH=/home/ubuntu/rust-quant-bot/data/sniper_trades.jsonl
+# NE PAS figer STATE_PATH/TRADES_PATH : le code choisit automatiquement le fichier selon le mode
+# (data/sniper_state.json en taker, data/sniper_maker_state.json en MAKER_MODE) → reset propre.
+# Pour activer le maker : décommenter la ligne ci-dessous.
+#Environment=MAKER_MODE=true
 Environment=START_CASH=200
 Environment=MAX_DRAWDOWN=20
 Environment=RUST_LOG=info
