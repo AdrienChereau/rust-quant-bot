@@ -61,6 +61,17 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     if cfg.live_armed {
         tracing::warn!(creds = live_creds.is_some(), "⚠️  LIVE_ARMED=true — envoi réel possible");
     }
+    // Filet anti-orpheline au démarrage : un crash/kill pendant un BUY GTC resting peut laisser
+    // un ordre dormant dans le carnet (non suivi par l'état rechargé). En maker armé, on balaie
+    // TOUT au boot pour repartir d'un carnet propre — aucune position n'existe encore à ce stade.
+    if maker_mode && cfg.live_armed {
+        if let Some(ref c) = live_creds {
+            match live_executor::cancel_all_orders(c).await {
+                Ok(()) => tracing::warn!("🧹 balayage démarrage maker — carnet vidé (orphelins éventuels annulés)"),
+                Err(e) => tracing::error!(error = %e, "⚠️  balayage démarrage maker échoué (orphelins possibles)"),
+            }
+        }
+    }
     if cfg.live_force_min_size {
         tracing::warn!("⚠️  LIVE_FORCE_MIN_SIZE=true — taille minimale forcée");
     }
@@ -143,6 +154,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut up_book: Arc<PolyBook> = Arc::new(PolyBook::default());
     let mut down_book: Arc<PolyBook> = Arc::new(PolyBook::default());
     let mut remaining_s: i64 = 0;
+    let mut last_sweep_ms: u64 = 0; // dernier balayage anti-orpheline (maker + Idle)
 
     tracing::info!("🔄 boucle live démarrée — tick 50 ms actif");
     loop {
@@ -284,34 +296,36 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         }
 
         // ── 0b. Drain fills user WS ────────────────────────────────────────────────────
+        // Draine TOUS les fills WS de ce tick (mpsc, pas watch : aucun fill coalescé/perdu →
+        // un fill multi-trades est entièrement réconcilié, pas d'orpheline).
         if let Some(ref mut fill_rx) = user_ws_fill_rx {
-            if fill_rx.has_changed().unwrap_or(false) {
-                if let Some(fill) = fill_rx.borrow_and_update().clone() {
-                    tracing::info!(order_id = %fill.order_id, filled = fill.filled_size,
-                        price = fill.avg_price, is_sell = fill.is_sell, "✅ fill confirmé via user WS");
-                    if fill.is_sell {
-                        if let Some((_, reason)) = pending_close.take() {
-                            live_mgr.apply_close(
-                                fill.order_id.clone(),
-                                Some(fill.filled_size),
-                                Some(fill.avg_price),
-                                reason,
-                            );
-                            if let (Some(creds), tx) = (live_creds.clone(), bk_tx.clone()) {
-                                tokio::spawn(async move {
-                                    if let Ok(b) = live_executor::get_collateral_balance(&creds).await {
-                                        let _ = tx.send(Some(b));
-                                    }
-                                });
-                            }
-                        }
-                    } else {
-                        // Fill BUY confirmé via WS → réconcilie une éventuelle position PendingBuy
-                        // (le POST n'avait pas renvoyé de filled_size). Sans effet si phase != PendingBuy.
-                        live_mgr.on_fill_confirmed_buy(
-                            &fill.order_id, fill.filled_size, fill.avg_price, now_ms,
+            while let Ok(fill) = fill_rx.try_recv() {
+                tracing::info!(order_id = %fill.order_id, filled = fill.filled_size,
+                    price = fill.avg_price, is_sell = fill.is_sell, "✅ fill confirmé via user WS");
+                if fill.is_sell {
+                    if let Some((_, reason)) = pending_close.take() {
+                        let min_os = market.as_ref().map(|m| m.min_order_size).unwrap_or(5.0);
+                        live_mgr.apply_close(
+                            fill.order_id.clone(),
+                            Some(fill.filled_size),
+                            Some(fill.avg_price),
+                            reason,
+                            min_os,
                         );
+                        if let (Some(creds), tx) = (live_creds.clone(), bk_tx.clone()) {
+                            tokio::spawn(async move {
+                                if let Ok(b) = live_executor::get_collateral_balance(&creds).await {
+                                    let _ = tx.send(Some(b));
+                                }
+                            });
+                        }
                     }
+                } else {
+                    // Fill BUY confirmé via WS → réconcilie PendingBuy → Open, ou accumule un
+                    // fill additionnel du même GTC si déjà Open (anti-orpheline multi-trades).
+                    live_mgr.on_fill_confirmed_buy(
+                        &fill.order_id, fill.filled_size, fill.avg_price, now_ms,
+                    );
                 }
             }
         }
@@ -340,18 +354,56 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             }
         }
 
-        // ── Maker : un BUY GTC qui dort trop longtemps sans fill → annuler + revenir Idle ──
+        // ── Maker : cycle de vie SÛR d'un BUY GTC resting (anti-orpheline) ───────────────
+        // RÈGLE : un fill GAGNE TOUJOURS. On n'envoie l'annulation qu'au timeout, et on ne passe
+        // Idle qu'APRÈS une fenêtre de grâce SANS fill (le fill, même tardif, repasse Open via WS).
         if maker_mode {
-            if let Some((buy_id, since_ms)) = live_mgr.pending_buy_info() {
-                if now_ms.saturating_sub(since_ms) >= cfg.buy_timeout_ms {
-                    if let Some(engine) = engine_tx.as_ref() {
-                        let (tx, _rx) = oneshot::channel();
-                        let _ = engine.try_send(OrderCmd::Cancel { order_id: buy_id.clone(), reply: tx });
+            if let Some((buy_id, since_ms, cancel_since)) = live_mgr.pending_buy_info() {
+                match cancel_since {
+                    None => {
+                        if now_ms.saturating_sub(since_ms) >= cfg.buy_timeout_ms {
+                            if let Some(engine) = engine_tx.as_ref() {
+                                let (tx, _rx) = oneshot::channel();
+                                let _ = engine.try_send(OrderCmd::Cancel { order_id: buy_id.clone(), reply: tx });
+                            }
+                            tracing::info!(order_id = %buy_id, "🗑 BUY GTC non rempli — annulation envoyée (fenêtre de grâce)");
+                            live_mgr.mark_buy_cancelling(now_ms);
+                        }
                     }
-                    tracing::info!(order_id = %buy_id, "🗑 BUY GTC non rempli (timeout) — annulation + skip");
-                    live_mgr.cancel_pending_buy();
+                    Some(cancel_t) => {
+                        if now_ms.saturating_sub(cancel_t) >= cfg.cancel_grace_ms {
+                            tracing::info!(order_id = %buy_id, "✓ BUY GTC annulé (aucun fill pendant la grâce) — Idle");
+                            live_mgr.cancel_pending_buy();
+                        }
+                    }
                 }
             }
+            // Backstop périodique : si une annulation a silencieusement échoué (erreur API,
+            // try_send abandonné) alors que la FSM est repassée Idle après la grâce, un ordre
+            // peut rester orphelin dans le carnet. Quand on est Idle (aucune position, aucun BUY
+            // suivi, aucun ordre en vol), on balaie le carnet ~toutes les 60 s. Money-safe : au
+            // pire on annule un BUY resting légitime AVANT son fill (= trade manqué, pas de perte).
+            if cfg.live_armed
+                && live_mgr.is_idle()
+                && pending_opens.is_empty()
+                && pending_close.is_none()
+                && now_ms.saturating_sub(last_sweep_ms) >= 60_000
+            {
+                last_sweep_ms = now_ms;
+                if let Some(creds) = live_creds.clone() {
+                    tokio::spawn(async move {
+                        if let Err(e) = live_executor::cancel_all_orders(&creds).await {
+                            tracing::error!(error = %e, "⚠️  balayage périodique maker échoué");
+                        }
+                    });
+                }
+            }
+        }
+
+        // Anti-position-coincée : un PendingSell sans confirmation WS au-delà du timeout repasse
+        // Open → la section 2 ci-dessous re-tente la vente (jamais bloqué à détenir une position).
+        if pending_close.is_none() {
+            live_mgr.revert_stuck_pending_sell(now_ms, cfg.sell_timeout_ms);
         }
 
         // ── 2. Live manage → OrderEngine SELL (non-bloquant) ─────────────────────────

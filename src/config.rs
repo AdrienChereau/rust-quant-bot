@@ -55,7 +55,11 @@ pub struct Config {
     pub exec_mode: String,     // EXEC_MODE : "taker" (FAK, chemin actuel) | "maker" (GTC resting).
                                // Défaut "taker" → le live actuel est préservé, le maker est opt-in.
     pub reward_max_spread: f64, // REWARD_MAX_SPREAD : poster l'ordre maker à ≤ ce spread du mid (bande rewards).
-    pub buy_timeout_ms: u64,    // BUY_TIMEOUT_MS : si le BUY GTC ne fill pas après ce délai → annuler + skip.
+    pub buy_timeout_ms: u64,    // BUY_TIMEOUT_MS : si le BUY GTC ne fill pas après ce délai → annuler.
+    pub sell_timeout_ms: u64,   // SELL_TIMEOUT_MS : PendingSell sans confirmation WS après ce délai →
+                                // on REPASSE Open pour re-tenter la vente (anti-position-coincée).
+    pub cancel_grace_ms: u64,   // CANCEL_GRACE_MS : après une annulation, fenêtre où un fill GAGNE encore
+                                // (→ Open) avant de déclarer Idle. Anti-orpheline (course annulation/fill).
     pub max_drawdown: f64,     // circuit breaker sur l'equity (en $)
     pub live_armed: bool,      // LIVE_ARMED : verrou matériel pour l'envoi RÉEL d'ordres
     pub live_force_min_size: bool, // LIVE_FORCE_MIN_SIZE : ignore Kelly, force la taille minimale
@@ -121,6 +125,8 @@ impl Config {
             exec_mode: env::var("EXEC_MODE").unwrap_or_else(|_| "taker".into()),
             reward_max_spread: env_or("REWARD_MAX_SPREAD", 0.03),
             buy_timeout_ms: env_or("BUY_TIMEOUT_MS", 8000u64),
+            sell_timeout_ms: env_or("SELL_TIMEOUT_MS", 3000u64),
+            cancel_grace_ms: env_or("CANCEL_GRACE_MS", 3000u64),
             max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
             live_armed: env_or("LIVE_ARMED", false),
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),

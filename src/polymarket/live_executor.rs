@@ -346,6 +346,18 @@ pub async fn cancel_order(creds: &LiveCredentials, order_id: &str) -> anyhow::Re
     anyhow::bail!("cancel hors sig_type=3 non implémenté (REST manuel à ajouter si besoin)")
 }
 
+/// Annule TOUS les ordres ouverts (filet anti-orpheline). À n'appeler que quand le bot ne suit
+/// aucun ordre légitime (Idle / démarrage). sig_type=3 → SDK V2.
+pub async fn cancel_all_orders(creds: &LiveCredentials) -> anyhow::Result<()> {
+    if creds.sig_type == 3 {
+        #[cfg(feature = "live")]
+        return crate::polymarket::poly1271::cancel_all_orders_poly1271(creds).await;
+        #[cfg(not(feature = "live"))]
+        anyhow::bail!("cancel_all sig_type=3 requiert `cargo build --features live`");
+    }
+    anyhow::bail!("cancel_all hors sig_type=3 non implémenté")
+}
+
 /// POST réel `/order` avec en-têtes L2 HMAC. Atteint seulement si `live_armed` ET signé.
 async fn post_order(creds: &LiveCredentials, body: &str) -> anyhow::Result<PlaceResult> {
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();

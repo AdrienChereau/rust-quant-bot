@@ -55,6 +55,10 @@ pub struct LivePosition {
     pub opened_ms: u64,
     pub neg_risk: bool,
     pub buy_order_id: String,
+    /// Pas de prix du marché — mémorisé pour re-rounder tp/sl si la position grossit (fill GTC
+    /// multi-trades). `serde(default)` = 0.0 pour les états persistés avant ce champ.
+    #[serde(default)]
+    pub tick: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +69,9 @@ pub enum ReconcileKind { Buy, Sell }
 pub enum LivePhase {
     #[default]
     Idle,
-    /// POST BUY accepté mais filled_size absent → attend fill WS ou timeout.
+    /// POST BUY accepté mais filled_size absent → l'ordre (GTC) dort, on attend fill WS ou timeout.
+    /// `cancel_since_ms` : None = en attente ; Some(t) = annulation envoyée à t, on attend la fenêtre
+    /// de grâce AVANT de déclarer Idle (un fill peut encore arriver et GAGNE toujours).
     PendingBuy {
         order_id: String,
         side: Side,
@@ -74,6 +80,7 @@ pub enum LivePhase {
         requested_size: f64,
         tick: f64,
         since_ms: u64,
+        cancel_since_ms: Option<u64>,
     },
     Open(LivePosition),
     /// POST SELL accepté mais filled_size absent → attend fill WS ou timeout.
@@ -112,14 +119,41 @@ impl LivePositionManager {
     /// Aucune position ni ordre en cours → on peut tirer un nouveau signal.
     pub fn is_idle(&self) -> bool { matches!(self.phase, LivePhase::Idle) }
 
-    /// Si un BUY GTC dort (PendingBuy) : (order_id, since_ms) pour gérer le timeout/cancel maker.
-    pub fn pending_buy_info(&self) -> Option<(String, u64)> {
-        if let LivePhase::PendingBuy { ref order_id, since_ms, .. } = self.phase {
-            Some((order_id.clone(), since_ms))
+    /// Anti-position-coincée : un `PendingSell` sans confirmation WS après `timeout_ms` est
+    /// REPASSÉ `Open` pour que la hot loop re-tente la vente. Si la vente d'origine avait en fait
+    /// rempli (WS lent), la re-vente échouera proprement (`no balance`) et la logique d'abandon
+    /// réglée prendra le relais — on ne reste JAMAIS bloqué à détenir une position invendue.
+    /// Retourne `true` si une re-tentative a été armée.
+    pub fn revert_stuck_pending_sell(&mut self, now_ms: u64, timeout_ms: u64) -> bool {
+        if let LivePhase::PendingSell { position, since_ms, .. } = &self.phase {
+            if now_ms.saturating_sub(*since_ms) >= timeout_ms {
+                let pos = position.clone();
+                tracing::warn!(token_id = %pos.token_id, held = pos.size,
+                    "⏱ PendingSell sans confirmation WS — re-tentative de vente (anti-blocage)");
+                self.phase = LivePhase::Open(pos);
+                self.persist();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Si un BUY GTC dort (PendingBuy) : (order_id, since_ms, cancel_since_ms) — pour le timeout maker.
+    pub fn pending_buy_info(&self) -> Option<(String, u64, Option<u64>)> {
+        if let LivePhase::PendingBuy { ref order_id, since_ms, cancel_since_ms, .. } = self.phase {
+            Some((order_id.clone(), since_ms, cancel_since_ms))
         } else { None }
     }
 
-    /// Abandonne un BUY GTC resting non rempli (timeout) → retour à Idle.
+    /// Marque qu'une annulation a été envoyée (timeout) — on NE passe PAS Idle tout de suite :
+    /// un fill peut encore arriver pendant la fenêtre de grâce et il GAGNE (→ Open via WS).
+    pub fn mark_buy_cancelling(&mut self, now_ms: u64) {
+        if let LivePhase::PendingBuy { ref mut cancel_since_ms, .. } = self.phase {
+            if cancel_since_ms.is_none() { *cancel_since_ms = Some(now_ms); self.persist(); }
+        }
+    }
+
+    /// Confirme l'abandon d'un BUY GTC (après la fenêtre de grâce, sans fill) → Idle.
     pub fn cancel_pending_buy(&mut self) {
         if matches!(self.phase, LivePhase::PendingBuy { .. }) {
             self.phase = LivePhase::Idle;
@@ -188,7 +222,7 @@ impl LivePositionManager {
                         tracing::warn!(order_id = %order_id, "BUY accepté sans fill_size — PendingBuy");
                         self.phase = LivePhase::PendingBuy {
                             order_id, side, token_id: token_id.to_string(), neg_risk,
-                            requested_size: size_final, tick, since_ms: now_ms,
+                            requested_size: size_final, tick, since_ms: now_ms, cancel_since_ms: None,
                         };
                     }
                 }
@@ -319,7 +353,7 @@ impl LivePositionManager {
                         tracing::warn!(order_id = %order_id, "BUY (Engine) sans fill_size — PendingBuy");
                         self.phase = LivePhase::PendingBuy {
                             order_id, side, token_id: token_id.to_string(), neg_risk,
-                            requested_size: _size, tick, since_ms: now_ms,
+                            requested_size: _size, tick, since_ms: now_ms, cancel_since_ms: None,
                         };
                     }
                 }
@@ -375,7 +409,7 @@ impl LivePositionManager {
                         tracing::warn!(order_id = %order_id, reason, "SELL (Engine) sans fill_size — PendingSell");
                         if let LivePhase::Open(pos) = std::mem::replace(&mut self.phase, LivePhase::Idle) {
                             self.phase = LivePhase::PendingSell {
-                                position: pos, reason: reason.to_string(), since_ms: 0,
+                                position: pos, reason: reason.to_string(), since_ms: now_ms,
                             };
                         }
                     }
@@ -395,10 +429,15 @@ impl LivePositionManager {
                     _ => u64::MAX,
                 };
                 let settled = held_ms >= SETTLE_GRACE_MS;
-                if settled && (no_balance || self.consec_close_fails >= 5) {
-                    // Réglé ET toujours introuvable → fermée à la main / réglée à l'expiration → abandon.
+                // On n'abandonne une position QUE sur `no_balance` après settlement : c'est le seul
+                // signal FIABLE que la position est réellement partie (vendue à la main / réglée à
+                // l'expiration). Une erreur non-`balance` (réseau, no-match, malformé) ne prouve PAS
+                // qu'on ne détient plus rien → on RE-TENTE indéfiniment jusqu'au rollover (qui règle
+                // on-chain via resolve_expired). Abandonner sur un simple compteur d'échecs lâcherait
+                // une position encore détenue → le bot rachèterait par-dessus. JAMAIS.
+                if settled && no_balance {
                     tracing::error!(error = %error, reason, held_ms,
-                        "🛑 position abandonnée (introuvable on-chain après settlement) — phase → Idle, voir bankroll");
+                        "🛑 position introuvable on-chain après settlement (balance=0) — phase → Idle, voir bankroll");
                     self.phase = LivePhase::Idle;
                     self.state.losses += 1;
                     self.consec_close_fails = 0;
@@ -406,8 +445,15 @@ impl LivePositionManager {
                     tracing::warn!(reason, held_ms,
                         "⏳ SELL en attente — BUY pas encore réglé on-chain (settlement), ré-essai");
                 } else {
-                    tracing::error!(error = %error, reason, consec = self.consec_close_fails,
-                        "❌ SELL live échoué (OrderEngine) — ré-essai au prochain tick");
+                    // Erreur non-`balance` : on garde la position et on ré-essaie. Au-delà de 5 échecs
+                    // d'affilée on alerte fort (carnet vide ? ordre malformé ?) sans JAMAIS abandonner.
+                    if self.consec_close_fails >= 5 {
+                        tracing::error!(error = %error, reason, consec = self.consec_close_fails, held_ms,
+                            "🚨 SELL échoue en boucle (position TOUJOURS détenue) — ré-essai jusqu'au rollover, vérifier le carnet");
+                    } else {
+                        tracing::error!(error = %error, reason, consec = self.consec_close_fails,
+                            "❌ SELL live échoué (OrderEngine) — ré-essai au prochain tick");
+                    }
                 }
                 self.persist();
             }
@@ -421,10 +467,11 @@ impl LivePositionManager {
         filled_size: Option<f64>,
         avg_price: Option<f64>,
         reason: &str,
+        min_order_size: f64,
     ) {
-        let (entry, side_str) = match &self.phase {
-            LivePhase::Open(p) => (p.entry_price, p.side.as_str().to_string()),
-            LivePhase::PendingSell { position: p, .. } => (p.entry_price, p.side.as_str().to_string()),
+        let (entry, side_str, pos_size) = match &self.phase {
+            LivePhase::Open(p) => (p.entry_price, p.side.as_str().to_string(), p.size),
+            LivePhase::PendingSell { position: p, .. } => (p.entry_price, p.side.as_str().to_string(), p.size),
             _ => {
                 tracing::warn!(reason, "apply_close ignoré — phase != Open/PendingSell");
                 return;
@@ -437,6 +484,25 @@ impl LivePositionManager {
             return;
         };
         let got = avg_price.unwrap_or(0.0);
+        // Fill PARTIEL re-vendable : encaisse le PnL des n vendus, réduit la position et REPASSE
+        // Open → la hot loop re-vend le reste. Sinon le reliquat serait orphelin (bot Idle → rachète).
+        if pos_size - n >= min_order_size {
+            let pnl = (got - entry) * n;
+            self.state.realized_pnl += pnl;
+            self.append("close_partial", &side_str, got, n, pnl, &order_id);
+            let mut pos = match std::mem::replace(&mut self.phase, LivePhase::Idle) {
+                LivePhase::Open(p) => p,
+                LivePhase::PendingSell { position, .. } => position,
+                _ => unreachable!("pos_size venait d'Open/PendingSell"),
+            };
+            pos.size = pos_size - n;
+            tracing::warn!(sold = n, remaining = pos.size, pnl = format!("{pnl:.2}"),
+                "↩ SELL partiel (WS) — on re-vend le reste");
+            self.phase = LivePhase::Open(pos);
+            self.consec_close_fails = 0;
+            self.persist();
+            return;
+        }
         self.record_close(order_id, &side_str, n, got, entry, reason);
     }
 
@@ -453,16 +519,42 @@ impl LivePositionManager {
     /// Confirmation WS d'un fill BUY → réconcilie `PendingBuy → Open` (le POST n'avait pas
     /// renvoyé de `filled_size`). Utilise le `neg_risk` mémorisé dans `PendingBuy`.
     pub fn on_fill_confirmed_buy(&mut self, order_id: &str, filled_size: f64, avg_price: f64, now_ms: u64) {
-        let LivePhase::PendingBuy { order_id: pend_id, side, token_id, neg_risk, tick, .. } = self.phase.clone()
-        else { return };
         if filled_size <= 0.0 { return; }
-        // Ne réconcilier que si le fill correspond au BUY en attente (sécurité multi-ordres).
-        if !pend_id.is_empty() && order_id != pend_id {
-            tracing::warn!(fill = %order_id, pending = %pend_id, "fill BUY WS d'un autre ordre — ignoré");
-            return;
+        match self.phase.clone() {
+            LivePhase::PendingBuy { order_id: pend_id, side, token_id, neg_risk, tick, .. } => {
+                // Ne réconcilier que si le fill correspond au BUY en attente (sécurité multi-ordres).
+                if !pend_id.is_empty() && order_id != pend_id {
+                    tracing::warn!(fill = %order_id, pending = %pend_id, "fill BUY WS d'un autre ordre — ignoré");
+                    return;
+                }
+                tracing::info!(order_id, filled_size, avg_price, "✅ PendingBuy réconcilié via user WS → Open");
+                self.open_position(side, &token_id, neg_risk, avg_price, filled_size, tick, order_id, now_ms);
+            }
+            // Fill ADDITIONNEL du même GTC alors qu'on est déjà Open : un ordre resting se remplit
+            // souvent en plusieurs trades WS. On ACCUMULE (sinon le reliquat devient orphelin : la
+            // position réelle dépasse celle qu'on gère → la perte exacte qu'on veut éliminer).
+            // Sur-compter est récupérable (la vente échoue/partielle, gérée par on_sell_result) ;
+            // sous-compter ne l'est pas. On biaise donc vers l'accumulation.
+            LivePhase::Open(mut p) if order_id == p.buy_order_id => {
+                let new_size = p.size + filled_size;
+                // Prix d'entrée pondéré par les tailles cumulées.
+                p.entry_price = (p.entry_price * p.size + avg_price * filled_size) / new_size;
+                p.size = new_size;
+                let tick = if p.tick > 0.0 { p.tick } else { 0.01 };
+                p.tp_price = round_tick((p.entry_price + self.params.tp_cents / 100.0).min(0.99), tick);
+                p.sl_price = round_tick((p.entry_price - self.params.sl_cents / 100.0).max(0.01), tick);
+                tracing::warn!(order_id, add = filled_size, size = new_size,
+                    entry = format!("{:.3}", p.entry_price),
+                    "➕ fill GTC additionnel (même ordre) — position agrandie, anti-orpheline");
+                self.append("add_fill", p.side.as_str(), avg_price, filled_size, 0.0, order_id);
+                self.phase = LivePhase::Open(p);
+                self.persist();
+            }
+            _ => {
+                tracing::warn!(fill = %order_id, phase = ?std::mem::discriminant(&self.phase),
+                    "fill BUY WS sans PendingBuy/Open correspondant — ignoré");
+            }
         }
-        tracing::info!(order_id, filled_size, avg_price, "✅ PendingBuy réconcilié via user WS → Open");
-        self.open_position(side, &token_id, neg_risk, avg_price, filled_size, tick, order_id, now_ms);
     }
 
     fn open_position(
@@ -482,7 +574,7 @@ impl LivePositionManager {
         let pos = LivePosition {
             side, token_id: token_id.to_string(), entry_price: entry, size: filled,
             tp_price: tp, sl_price: sl, opened_ms: now_ms, neg_risk,
-            buy_order_id: order_id.to_string(),
+            buy_order_id: order_id.to_string(), tick,
         };
         self.append("open", side.as_str(), entry, filled, 0.0, order_id);
         tracing::warn!(side = side.as_str(), token_id, entry = format!("{entry:.3}"),
@@ -560,6 +652,17 @@ mod tests {
         )
     }
 
+    // Manager sur fichier d'état dédié (évite la collision /tmp entre tests parallèles).
+    fn mgr_named(tag: &str) -> LivePositionManager {
+        let p = format!("/tmp/live_state_test_{tag}.json");
+        let _ = fs::remove_file(&p);
+        LivePositionManager::load_or_init(
+            KellyParams { kelly_fraction: 0.5, max_size_pct: 0.10, tp_cents: 4.0, sl_cents: 3.0, max_hold_secs: 60 },
+            p.into(),
+            format!("/tmp/live_trades_test_{tag}.jsonl").into(),
+        )
+    }
+
     #[test]
     fn fresh_manager_has_no_position_no_state() {
         let m = mgr();
@@ -596,6 +699,76 @@ mod tests {
     }
 
     #[test]
+    fn fill_wins_the_cancel_race() {
+        // Anti-orpheline : un BUY GTC resting passe en annulation (timeout), MAIS le fill arrive
+        // pendant la fenêtre de grâce → la position DOIT s'ouvrir (le fill gagne toujours).
+        let mut m = mgr_named("fill_wins_race");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "o1".into(), filled_size: None, avg_price: None,
+                post_ms: 50 },
+            Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
+        );
+        assert!(matches!(m.phase, LivePhase::PendingBuy { .. }));
+        // Timeout → on marque l'annulation (mais on NE passe PAS Idle).
+        m.mark_buy_cancelling(2000);
+        match m.pending_buy_info() {
+            Some((id, _, cancel_since)) => {
+                assert_eq!(id, "o1");
+                assert_eq!(cancel_since, Some(2000), "cancel_since doit être posé");
+            }
+            None => panic!("doit rester PendingBuy après mark_buy_cancelling"),
+        }
+        // Le fill arrive (tardif) → la position s'ouvre malgré l'annulation en cours.
+        m.on_fill_confirmed_buy("o1", 10.0, 0.50, 2500);
+        assert!(matches!(m.phase, LivePhase::Open(_)), "le fill doit ouvrir la position, got {:?}", m.phase);
+        assert!(m.position().is_some());
+    }
+
+    #[test]
+    fn multi_trade_gtc_fill_accumulates_not_orphans() {
+        // Un GTC resting se remplit en 2 trades WS. Le 2ᵉ arrive en phase Open → on DOIT
+        // accumuler (taille totale = somme), sinon le reliquat est orphelin (perte silencieuse).
+        let mut m = mgr_named("multi_fill_accum");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "g1".into(), filled_size: None, avg_price: None,
+                post_ms: 50 },
+            Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
+        );
+        // 1er fill partiel (6 @ 0.50) → ouvre la position.
+        m.on_fill_confirmed_buy("g1", 6.0, 0.50, 1100);
+        // 2e fill partiel du MÊME ordre (4 @ 0.52) alors qu'on est Open → doit s'accumuler.
+        m.on_fill_confirmed_buy("g1", 4.0, 0.52, 1200);
+        match &m.phase {
+            LivePhase::Open(p) => {
+                assert!((p.size - 10.0).abs() < 1e-9, "taille cumulée doit être 10, got {}", p.size);
+                // entrée pondérée = (6*0.50 + 4*0.52)/10 = 0.508
+                assert!((p.entry_price - 0.508).abs() < 1e-9, "entry pondérée, got {}", p.entry_price);
+            }
+            other => panic!("doit rester Open, got {other:?}"),
+        }
+        // Un fill d'un AUTRE ordre ne doit pas toucher la position.
+        m.on_fill_confirmed_buy("autre", 5.0, 0.40, 1300);
+        if let LivePhase::Open(p) = &m.phase {
+            assert!((p.size - 10.0).abs() < 1e-9, "fill d'un autre ordre ignoré");
+        } else { panic!("doit rester Open"); }
+    }
+
+    #[test]
+    fn cancel_after_grace_without_fill_goes_idle() {
+        // Si AUCUN fill n'arrive pendant la grâce, l'annulation aboutit → Idle (pas d'orpheline).
+        let mut m = mgr_named("cancel_grace_idle");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "o1".into(), filled_size: None, avg_price: None,
+                post_ms: 50 },
+            Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
+        );
+        m.mark_buy_cancelling(2000);
+        m.cancel_pending_buy();
+        assert!(m.is_idle(), "sans fill, l'annulation aboutie repasse Idle, got {:?}", m.phase);
+        assert!(m.position().is_none());
+    }
+
+    #[test]
     fn sell_result_without_fill_goes_pending_sell() {
         let mut m = mgr();
         // Ouvre d'abord une position.
@@ -623,7 +796,7 @@ mod tests {
                 post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
-        m.apply_close("o2".into(), Some(10.0), Some(0.54), "take_profit");
+        m.apply_close("o2".into(), Some(10.0), Some(0.54), "take_profit", 5.0);
         assert!(matches!(m.phase, LivePhase::Idle));
         assert_eq!(m.state.wins, 1);
         assert!((m.state.realized_pnl - 0.40).abs() < 1e-6, "pnl = (0.54-0.50)*10 = 0.40");
@@ -645,9 +818,53 @@ mod tests {
             "stop_loss", 1000, 5.0,
         );
         // apply_close sans fill : ne doit pas clôturer.
-        m.apply_close("o2".into(), None, None, "stop_loss");
+        m.apply_close("o2".into(), None, None, "stop_loss", 5.0);
         assert!(!matches!(m.phase, LivePhase::Idle), "Idle sans fill = dangereux");
         let _ = fs::remove_file("/tmp/live_state_test_phase_c.json");
+    }
+
+    #[test]
+    fn stuck_pending_sell_reverts_to_open_for_retry() {
+        // ANTI-COINCÉE : un PendingSell sans confirmation WS au-delà du timeout doit REPASSER Open
+        // (re-vente au tick suivant), jamais rester bloqué à détenir une position invendue.
+        let mut m = mgr_named("stuck_pending_sell");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "o1".into(), filled_size: Some(10.0), avg_price: Some(0.50),
+                post_ms: 50 },
+            Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
+        );
+        m.on_sell_result(
+            OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None, post_ms: 30 },
+            "stop_loss", 5_000, 5.0,
+        );
+        assert!(matches!(m.phase, LivePhase::PendingSell { .. }));
+        // Avant le timeout : on reste PendingSell.
+        assert!(!m.revert_stuck_pending_sell(6_000, 3_000), "1s < timeout → pas de revert");
+        assert!(matches!(m.phase, LivePhase::PendingSell { .. }));
+        // Après le timeout (8s - 5s = 3s ≥ 3000) : repasse Open, position intacte (re-vendable).
+        assert!(m.revert_stuck_pending_sell(8_000, 3_000), "timeout atteint → revert");
+        match &m.phase {
+            LivePhase::Open(p) => assert!((p.size - 10.0).abs() < 1e-9, "position intacte"),
+            other => panic!("doit repasser Open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_ws_close_keeps_remainder_open() {
+        // GAP B : un fill SELL PARTIEL confirmé via WS doit réduire la position et rester Open
+        // (re-vente du reste), pas passer Idle avec un reliquat orphelin.
+        let mut m = mgr_named("partial_ws_close");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "o1".into(), filled_size: Some(10.0), avg_price: Some(0.50),
+                post_ms: 50 },
+            Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
+        );
+        // Vend 6 sur 10 via WS → reste 4 (≥ min 5 ? non : 4 < 5 → dust). Prends 7 pour rester ≥ min.
+        m.apply_close("o2".into(), Some(7.0), Some(0.54), "take_profit", 1.0);
+        match &m.phase {
+            LivePhase::Open(p) => assert!((p.size - 3.0).abs() < 1e-9, "reste 3 à re-vendre, got {}", p.size),
+            other => panic!("doit rester Open (reliquat re-vendable), got {other:?}"),
+        }
     }
 
     #[test]

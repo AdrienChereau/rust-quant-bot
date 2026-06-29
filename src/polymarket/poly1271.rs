@@ -183,6 +183,20 @@ pub async fn cancel_order_poly1271(creds: &LiveCredentials, order_id: &str) -> a
     Ok(())
 }
 
+/// Annule TOUS les ordres ouverts du compte (filet de sécurité anti-orpheline). À n'appeler que
+/// quand le bot ne suit AUCUN ordre légitime (Idle), p.ex. au démarrage ou en balayage périodique.
+pub async fn cancel_all_orders_poly1271(creds: &LiveCredentials) -> anyhow::Result<()> {
+    if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
+        let client = cache_lock.lock().await;
+        client.cancel_all_orders().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    } else {
+        let signer = local_signer(creds)?;
+        let client = authenticated_client(creds, &signer).await?;
+        client.cancel_all_orders().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn place_with_client<S: Signer>(
     client: &Client<Authenticated<Normal>>,

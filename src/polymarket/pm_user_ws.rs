@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::live_executor::LiveCredentials;
@@ -38,12 +38,13 @@ pub struct FillEvent {
 /// Lance la task WS user **une fois** au boot.
 /// Retourne :
 /// - `watch::Sender<Option<String>>` : l'executor y envoie le `condition_id` du marché courant
-/// - `watch::Receiver<Option<FillEvent>>` : l'executor surveille les fills confirmés
+/// - `mpsc::UnboundedReceiver<FillEvent>` : l'executor draine TOUS les fills confirmés. mpsc (pas
+///   watch) car un `watch` coalesce : deux fills dans le même tick → le 1er écrasé → orphelin.
 pub fn init_user_ws(
     creds: LiveCredentials,
-) -> (watch::Sender<Option<String>>, watch::Receiver<Option<FillEvent>>) {
+) -> (watch::Sender<Option<String>>, mpsc::UnboundedReceiver<FillEvent>) {
     let (cond_tx, mut cond_rx) = watch::channel(None::<String>);
-    let (fill_tx, fill_rx) = watch::channel(None::<FillEvent>);
+    let (fill_tx, fill_rx) = mpsc::unbounded_channel::<FillEvent>();
 
     tokio::spawn(async move {
         let mut backoff = 1u64;
@@ -71,7 +72,7 @@ async fn run_ws_session(
     creds: &LiveCredentials,
     initial_condition_id: &str,
     cond_rx: &mut watch::Receiver<Option<String>>,
-    fill_tx: &watch::Sender<Option<FillEvent>>,
+    fill_tx: &mpsc::UnboundedSender<FillEvent>,
 ) -> anyhow::Result<()> {
     tracing::info!("pm_user_ws: connexion WS user…");
     let (ws, _) = tokio::time::timeout(
@@ -135,7 +136,7 @@ async fn subscribe(
         .map_err(|e| anyhow::anyhow!("pm_user_ws send: {e}"))
 }
 
-fn process_message(txt: &str, fill_tx: &watch::Sender<Option<FillEvent>>) {
+fn process_message(txt: &str, fill_tx: &mpsc::UnboundedSender<FillEvent>) {
     let events = parse_events::<UserEvent>(txt);
     for ev in events {
         match ev.event_type.as_deref() {
@@ -151,7 +152,7 @@ fn process_message(txt: &str, fill_tx: &watch::Sender<Option<FillEvent>>) {
                         let is_sell = ev.side.as_deref() == Some("SELL");
                         tracing::info!(order_id = %order_id, filled_size, avg_price, is_sell,
                             "pm_user_ws: fill confirmé");
-                        let _ = fill_tx.send(Some(FillEvent { order_id, filled_size, avg_price, is_sell }));
+                        let _ = fill_tx.send(FillEvent { order_id, filled_size, avg_price, is_sell });
                     }
                 }
             }
@@ -187,16 +188,14 @@ struct UserEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::watch;
 
-    fn make_fill_tx() -> watch::Sender<Option<FillEvent>> {
-        watch::channel(None::<FillEvent>).0
+    fn make_chan() -> (mpsc::UnboundedSender<FillEvent>, mpsc::UnboundedReceiver<FillEvent>) {
+        mpsc::unbounded_channel::<FillEvent>()
     }
 
     #[test]
     fn trade_event_taker_produces_fill() {
-        let tx = make_fill_tx();
-        let mut rx = tx.subscribe();
+        let (tx, mut rx) = make_chan();
         let txt = serde_json::json!([{
             "type": "trade",
             "taker_order_id": "order-abc",
@@ -207,7 +206,7 @@ mod tests {
             "status": "MATCHED"
         }]).to_string();
         process_message(&txt, &tx);
-        let fill = rx.borrow().clone().expect("fill doit être publié");
+        let fill = rx.try_recv().expect("fill doit être publié");
         assert_eq!(fill.order_id, "order-abc");
         assert!((fill.filled_size - 10.5).abs() < 1e-9);
         assert!((fill.avg_price - 0.52).abs() < 1e-9);
@@ -216,8 +215,7 @@ mod tests {
 
     #[test]
     fn trade_event_sell_side_sets_is_sell() {
-        let tx = make_fill_tx();
-        let mut rx = tx.subscribe();
+        let (tx, mut rx) = make_chan();
         let txt = serde_json::json!([{
             "type": "trade",
             "taker_order_id": "sell-order",
@@ -226,14 +224,13 @@ mod tests {
             "side": "SELL",
         }]).to_string();
         process_message(&txt, &tx);
-        let fill = rx.borrow().clone().unwrap();
+        let fill = rx.try_recv().unwrap();
         assert!(fill.is_sell);
     }
 
     #[test]
     fn order_update_does_not_produce_fill_event() {
-        let tx = make_fill_tx();
-        let mut rx = tx.subscribe();
+        let (tx, mut rx) = make_chan();
         let txt = serde_json::json!([{
             "type": "order",
             "id": "order-abc",
@@ -241,13 +238,12 @@ mod tests {
             "price": "0.50"
         }]).to_string();
         process_message(&txt, &tx);
-        assert!(rx.borrow().is_none(), "order UPDATE ne doit pas publier de FillEvent");
+        assert!(rx.try_recv().is_err(), "order UPDATE ne doit pas publier de FillEvent");
     }
 
     #[test]
     fn trade_with_zero_size_ignored() {
-        let tx = make_fill_tx();
-        let mut rx = tx.subscribe();
+        let (tx, mut rx) = make_chan();
         let txt = serde_json::json!([{
             "type": "trade",
             "taker_order_id": "order-abc",
@@ -255,6 +251,23 @@ mod tests {
             "price": "0.50",
         }]).to_string();
         process_message(&txt, &tx);
-        assert!(rx.borrow().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn two_fills_same_batch_both_delivered() {
+        // ANTI-ORPHELINE : deux trades dans le même message (même tick) doivent TOUS deux être
+        // livrés. Un canal `watch` en aurait coalescé un → reliquat orphelin. mpsc les garde.
+        let (tx, mut rx) = make_chan();
+        let txt = serde_json::json!([
+            { "type": "trade", "taker_order_id": "g1", "size": "6.0", "price": "0.50", "side": "BUY" },
+            { "type": "trade", "taker_order_id": "g1", "size": "4.0", "price": "0.52", "side": "BUY" }
+        ]).to_string();
+        process_message(&txt, &tx);
+        let f1 = rx.try_recv().expect("1er fill");
+        let f2 = rx.try_recv().expect("2e fill ne doit PAS être perdu");
+        assert!((f1.filled_size - 6.0).abs() < 1e-9);
+        assert!((f2.filled_size - 4.0).abs() < 1e-9);
+        assert!(rx.try_recv().is_err(), "exactement 2 fills");
     }
 }

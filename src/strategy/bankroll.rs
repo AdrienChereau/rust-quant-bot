@@ -329,9 +329,13 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static CTR: AtomicU64 = AtomicU64::new(0);
         let id = CTR.fetch_add(1, Ordering::Relaxed);
+        // Hermétique : le compteur repart à 0 à chaque process, donc les fichiers d'un run
+        // précédent seraient rechargés (état stale → wins/shots cumulés). On part propre.
+        let sp = format!("/tmp/sniper_s_test_{id}.json");
+        let _ = fs::remove_file(&sp);
         PaperEngine::load_or_init(
             200.0, params(),
-            format!("/tmp/sniper_s_test_{id}.json"),
+            sp,
             format!("/tmp/sniper_t_test_{id}.jsonl"),
         )
     }
