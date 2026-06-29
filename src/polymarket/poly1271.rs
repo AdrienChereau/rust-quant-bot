@@ -126,52 +126,49 @@ pub async fn place_order_poly1271(
     let signer = local_signer(creds)?;
     let token = U256::from_str(token_id).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
 
-    // Récupère les métadonnées depuis le cache si dispo (peuplé au rollover par preload_token_meta).
-    // Sinon fallback réseau (neg_risk + tick_size) — path lent, ne devrait arriver qu'au 1er ordre.
-    let (price_dp, neg_risk_val) = if let Some(cache) = TOKEN_META.get() {
-        // Cloner AVANT le if/else : le MutexGuard (std) ne doit pas être tenu à travers le `.await`
-        // du fallback réseau ci-dessous, sinon le future n'est plus `Send` (→ tokio::spawn refusé).
-        let cached_meta = cache.lock().unwrap().get(token_id).cloned();
-        if let Some(meta) = cached_meta {
-            tracing::debug!(token_id, neg_risk = meta.neg_risk, "métadonnées depuis cache");
-            (meta.price_dp, meta.neg_risk)
-        } else {
-            // Fallback : réseau
-            let client_tmp = authenticated_client(creds, &signer).await?;
-            let (neg, tick) = tokio::join!(client_tmp.neg_risk(token), client_tmp.tick_size(token));
+    // Métadonnées (price_dp + neg_risk) : cache si dispo (peuplé au rollover par preload_token_meta),
+    // sinon fallback réseau. Le fallback réutilise le client CACHÉ (pas de nouvelle auth = plus rapide).
+    // Clone AVANT tout `.await` : le MutexGuard std de TOKEN_META ne doit pas traverser un await (Send).
+    let cached_meta = TOKEN_META.get().and_then(|c| c.lock().unwrap().get(token_id).cloned());
+    let meta_t0 = std::time::Instant::now();
+    let (price_dp, neg_risk_val, from_cache) = match cached_meta {
+        Some(meta) => (meta.price_dp, meta.neg_risk, true),
+        None => {
+            // Fallback réseau (neg_risk + tick_size). Réutilise CACHED_AUTH_CLIENT si présent.
+            let (neg, tick) = if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
+                let client = cache_lock.lock().await;
+                tokio::join!(client.neg_risk(token), client.tick_size(token))
+            } else {
+                let client_tmp = authenticated_client(creds, &signer).await?;
+                tokio::join!(client_tmp.neg_risk(token), client_tmp.tick_size(token))
+            };
             let neg = neg.map_err(|e| anyhow::anyhow!("{e}"))?;
             let tick = tick.map_err(|e| anyhow::anyhow!("{e}"))?;
-            tracing::warn!(token_id, "cache TOKEN_META miss — fallback réseau neg_risk+tick_size");
-            (tick.minimum_tick_size.as_decimal().scale(), neg.neg_risk)
+            (tick.minimum_tick_size.as_decimal().scale(), neg.neg_risk, false)
         }
-    } else {
-        // Cache non initialisé (startup_poly pas encore appelé) — fallback réseau complet.
-        let client_tmp = authenticated_client(creds, &signer).await?;
-        let (neg, tick) = tokio::join!(client_tmp.neg_risk(token), client_tmp.tick_size(token));
-        let neg = neg.map_err(|e| anyhow::anyhow!("{e}"))?;
-        let tick = tick.map_err(|e| anyhow::anyhow!("{e}"))?;
-        (tick.minimum_tick_size.as_decimal().scale(), neg.neg_risk)
     };
-    tracing::debug!(token_id, neg_risk = neg_risk_val, "order metadata prêt");
+    let meta_ms = meta_t0.elapsed().as_millis() as u64;
+    if !from_cache {
+        tracing::warn!(token_id, meta_ms, "⏱ métadonnées via fallback réseau (cache miss — lent)");
+    }
 
     let price = decimal_from_f64(args.price, price_dp, "price")?;
     let size = decimal_from_f64(args.size, 2, "size")?; // lot max 2 décimales (SDK)
-    // `args.side` (Up/Down) sélectionne le **token** côté appelant ; ici on porte BUY/SELL.
+    let _ = neg_risk_val;
     let side = if args.is_sell { Side::Sell } else { Side::Buy };
 
-    // Utilise le client caché (init_auth_client au démarrage) ou en crée un si absent.
-    // Le guard est tenu le temps du sign+post (ordre unique en cours de toute façon).
+    // Client caché (init au démarrage) ou temporaire si absent.
     if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
         let client = cache_lock.lock().await;
-        place_with_client(&*client, &signer, token, side, price, size, live_armed, args.is_sell).await
+        place_with_client(&*client, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms).await
     } else {
-        // Fallback : client temporaire (startup_poly pas encore appelé).
         tracing::warn!("CACHED_AUTH_CLIENT absent — authenticate() per-ordre (lent)");
         let client_tmp = authenticated_client(creds, &signer).await?;
-        place_with_client(&client_tmp, &signer, token, side, price, size, live_armed, args.is_sell).await
+        place_with_client(&client_tmp, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms).await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn place_with_client<S: Signer>(
     client: &Client<Authenticated<Normal>>,
     signer: &S,
@@ -181,7 +178,9 @@ async fn place_with_client<S: Signer>(
     size: Decimal,
     live_armed: bool,
     is_sell: bool,
+    meta_ms: u64,
 ) -> anyhow::Result<PlaceResult> {
+    let build_t0 = std::time::Instant::now();
     let signable = client
         .limit_order()
         .token_id(token)
@@ -192,8 +191,11 @@ async fn place_with_client<S: Signer>(
         .build()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let build_ms = build_t0.elapsed().as_millis() as u64;
 
+    let sign_t0 = std::time::Instant::now();
     let signed = client.sign(signer, signable).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let sign_ms = sign_t0.elapsed().as_millis() as u64;
     let sig_len = match &signed.signature {
         OrderSignature::Wrapped(s) => s.len(),
         OrderSignature::Ecdsa(_) => 65,
@@ -236,8 +238,10 @@ async fn place_with_client<S: Signer>(
         }
         _ => (None, None),
     };
-    tracing::warn!(post_ms, order_id = %resp.order_id, ?filled_size, ?avg_price,
-        "✅ ordre LIVE POLY_1271 accepté");
+    let total_ms = meta_ms + build_ms + sign_ms + post_ms;
+    tracing::warn!(meta_ms, build_ms, sign_ms, post_ms, total_ms,
+        order_id = %resp.order_id, ?filled_size, ?avg_price,
+        "✅ ordre LIVE POLY_1271 accepté — latence décomposée");
     Ok(PlaceResult::Placed { order_id: resp.order_id, filled_size, avg_price, post_ms })
 }
 
