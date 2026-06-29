@@ -183,6 +183,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
         std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
+    paper.maker = cfg.maker_mode;
     // Manager LIVE — symétrique au PaperEngine, persistance séparée.
     let mut live_mgr = LivePositionManager::load_or_init(
         kelly,

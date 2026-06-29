@@ -58,6 +58,8 @@ pub struct Config {
                                    // (agressif — micro-test plomberie sur petite bankroll)
     pub fixed_order_usd: f64,      // FIXED_ORDER_USD > 0 : ignore Kelly, force un notionnel fixe ($)
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
+    pub maker_mode: bool,          // MAKER_MODE (paper) : simule une entrée maker (fill au bid) au lieu
+                                   // de taker (VWAP des asks) → capte le spread. Optimiste (fill garanti).
     pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties (garantit le
                                    // fill de la vente ; la FAK price-improve).
     pub entry_buffer: f64,         // ENTRY_BUFFER : marge AU-DESSUS de l'ask pour l'achat (garantit
@@ -116,6 +118,7 @@ impl Config {
             live_armed: env_or("LIVE_ARMED", false),
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
+            maker_mode: env_or("MAKER_MODE", false),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
             entry_buffer: env_or("ENTRY_BUFFER", 0.02),
             min_hold_sl_ms: env_or("MIN_HOLD_SL_MS", 500u64),

@@ -52,8 +52,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         std::env::var("TRADES_PATH").unwrap_or_else(|_| "data/sniper_trades.jsonl".into()),
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
+    paper.maker = cfg.maker_mode;
     if cfg.fixed_order_usd > 0.0 {
         tracing::warn!(usd = cfg.fixed_order_usd, "⚠️ FIXED_ORDER_USD actif — Kelly ignoré (tests)");
+    }
+    if cfg.maker_mode {
+        tracing::warn!("📐 MAKER_MODE actif — entrée simulée au bid (capte le spread, optimiste)");
     }
 
     let mut rx = udp::listen(listen_port).await?;

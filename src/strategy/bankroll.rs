@@ -67,6 +67,8 @@ pub struct PaperEngine {
     pub position: Option<OpenPosition>,
     /// > 0 : notionnel fixe en $ par tir (ignore Kelly). 0 = sizing Kelly normal.
     pub fixed_order_usd: f64,
+    /// true : simule une entrée MAKER (fill au bid, capte le spread). false : taker (VWAP asks).
+    pub maker: bool,
     params: KellyParams,
     state_path: String,
     trades_path: String,
@@ -89,7 +91,7 @@ impl PaperEngine {
             .and_then(|s| serde_json::from_str::<SniperState>(&s).ok())
             .unwrap_or(SniperState { cash: start_cash, start_cash, peak_equity: start_cash, ..Default::default() });
         tracing::info!(cash = state.cash, shots = state.shots, wins = state.wins, "État sniper chargé");
-        Self { state, position: None, fixed_order_usd: 0.0, params, state_path, trades_path }
+        Self { state, position: None, fixed_order_usd: 0.0, maker: false, params, state_path, trades_path }
     }
 
     pub fn equity(&self, mark: Option<f64>) -> f64 {
@@ -119,18 +121,25 @@ impl PaperEngine {
             return false; // un seul tir à la fois
         }
         let Some(best_ask) = book.best_ask() else { return false };
+        // Prix de référence d'entrée : bid en MAKER (on poste et on capte le spread), ask en taker.
+        let entry_ref = if self.maker { book.best_bid().unwrap_or(best_ask) } else { best_ask };
         // Notionnel fixe ($) si activé (tests/comparaison) — sinon sizing Kelly normal.
         let size = if self.fixed_order_usd > 0.0 {
-            (self.fixed_order_usd / best_ask).floor().max(min_size)
+            (self.fixed_order_usd / entry_ref).floor().max(min_size)
         } else {
-            self.kelly_size(edge, best_ask)
+            self.kelly_size(edge, entry_ref)
         };
         if size < min_size {
             self.state.blocked_size += 1;
             return false;
         }
-        // Slippage : VWAP des asks consommés.
-        let (avg_price, filled) = vwap_buy(book, size);
+        // MAKER : fill au bid (hypothèse OPTIMISTE = fill garanti, pas de sélection adverse → borne
+        // haute du maker). TAKER : VWAP en parcourant les asks (paie le spread + slippage).
+        let (avg_price, filled) = if self.maker {
+            (entry_ref, size)
+        } else {
+            vwap_buy(book, size)
+        };
         if filled <= 0.0 {
             return false;
         }
