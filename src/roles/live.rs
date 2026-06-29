@@ -312,9 +312,13 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 if let Some(m) = &market {
                     let book = if pos.side == Side::Up { &*up_book } else { &*down_book };
                     if let Some(bid) = book.best_bid() {
-                        let held_s = (now_ms.saturating_sub(pos.opened_ms) / 1000) as i64;
+                        let held_ms = now_ms.saturating_sub(pos.opened_ms);
+                        let held_s = (held_ms / 1000) as i64;
+                        // TP : immédiat (on encaisse un move favorable dès qu'il arrive).
+                        // SL : armé seulement après MIN_HOLD_SL_MS (évite le SL instantané sur le
+                        //      spread d'entrée). max_hold/fin de fenêtre = sortie forcée.
                         let reason = if bid >= pos.tp_price { Some("take_profit") }
-                            else if bid <= pos.sl_price { Some("stop_loss") }
+                            else if held_ms >= cfg.min_hold_sl_ms && bid <= pos.sl_price { Some("stop_loss") }
                             else if held_s >= kelly.max_hold_secs || remaining_s <= 30 { Some("max_hold") }
                             else { None };
                         if let Some(r) = reason {
