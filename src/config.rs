@@ -52,6 +52,8 @@ pub struct Config {
     pub max_hold_secs: i64,
 
     // Live testing (passage paper → réel)
+    pub exec_mode: String,     // EXEC_MODE : "taker" (FAK, chemin actuel) | "maker" (GTC resting).
+                               // Défaut "taker" → le live actuel est préservé, le maker est opt-in.
     pub max_drawdown: f64,     // circuit breaker sur l'equity (en $)
     pub live_armed: bool,      // LIVE_ARMED : verrou matériel pour l'envoi RÉEL d'ordres
     pub live_force_min_size: bool, // LIVE_FORCE_MIN_SIZE : ignore Kelly, force la taille minimale
@@ -114,6 +116,7 @@ impl Config {
             stop_loss_cents: env_or("STOP_LOSS_CENTS", 3.0),
             max_hold_secs: env_or("MAX_HOLD_SECS", 60),
 
+            exec_mode: env::var("EXEC_MODE").unwrap_or_else(|_| "taker".into()),
             max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
             live_armed: env_or("LIVE_ARMED", false),
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
