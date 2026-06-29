@@ -26,8 +26,17 @@ pub struct Config {
     // FSM sniper (P4)
     pub obi_dwell_ms: u64,           // persistance avant tir
     pub cooldown_ms: u64,
-    pub gap_min: f64,                // |fair − real| minimal
+    pub gap_min: f64,                // |fair − real| minimal (plancher du gap requis)
+    pub gap_dynamic_k: f64,          // GAP_DYNAMIC_K : gap requis += k·|real_up−0.5|·(temps_écoulé/fenêtre)
+                                     // → exige un edge d'autant plus grand que le binaire est décidé ET tardif.
     pub velocity_confirm: f64,       // |ΔP_1s| minimal (0 = désactivé)
+
+    // Garde-fou binaire (anti deep-ITM/OTM)
+    pub price_min: f64,              // PRICE_MIN : real_up min pour trader (sinon binaire trop décidé)
+    pub price_max: f64,              // PRICE_MAX : real_up max pour trader
+    // Volatilité (fair_up B&S, côté radar)
+    pub vol_window_ms: u64,          // VOL_WINDOW_MS : fenêtre de calcul σ (longue = robuste aux impulsions)
+    pub vol_sigma_cap: f64,          // VOL_SIGMA_CAP : plafond de σ annualisé (anti-pic sur impulsion)
 
     // Défensif (P4)
     pub vacuum_velocity: f64,        // ΔP_1s ≤ seuil → vide de liquidité
@@ -81,11 +90,18 @@ impl Config {
             obi_dwell_ms: env_or("OBI_DWELL_MS", 0),
             cooldown_ms: env_or("COOLDOWN_MS", 3000),
             gap_min: env_or("GAP_MIN", 0.02),
+            gap_dynamic_k: env_or("GAP_DYNAMIC_K", 0.5),
             velocity_confirm: env_or("VELOCITY_CONFIRM", 0.0),
+
+            price_min: env_or("PRICE_MIN", 0.02),
+            price_max: env_or("PRICE_MAX", 0.98),
+            vol_window_ms: env_or("VOL_WINDOW_MS", 30000u64),
+            vol_sigma_cap: env_or("VOL_SIGMA_CAP", 2.0),
 
             vacuum_velocity: env_or("VACUUM_VELOCITY", -0.0010),
             vacuum_obi: env_or("VACUUM_OBI", -0.40),
-            end_window_block_secs: env_or("END_WINDOW_BLOCK_SECS", 60),
+            // On peut trader en fin de fenêtre (le gap dynamique exige l'edge) — petit garde minimal.
+            end_window_block_secs: env_or("END_WINDOW_BLOCK_SECS", 5),
 
             start_cash: env_or("START_CASH", 200.0),
             kelly_fraction: env_or("KELLY_FRACTION", 0.5),

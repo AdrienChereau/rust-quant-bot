@@ -83,7 +83,9 @@ pub async fn run(cfg: Config, target_ip: String, target_port: u16) -> anyhow::Re
         cfg.obi_floor_per_exchange, cfg.obi_fire_threshold, cfg.weight_binance, cfg.weight_okx);
     let sniper = Sniper::new(cfg.obi_dwell_ms, cfg.cooldown_ms, 0.0, cfg.velocity_confirm);
     let vel = VelocityTracker::new(1000);
-    let vol = VolatilityTracker::new(2000, 0.80);
+    // Fenêtre de vol allongée + cap σ (appliqué au calcul du fair) → une impulsion brutale
+    // ne fait plus exploser σ et donc ne fausse plus le fair_up B&S (faux gaps en fin de fenêtre).
+    let vol = VolatilityTracker::new(cfg.vol_window_ms, 0.80);
 
     // Signal task event-driven — se déclenche à chaque update WS (pas de tick).
     spawn_signal_task(bin_rx, okx_rx, vel, vol, sniper, consolidated, live_sender, paper_sender, strike, cfg, dash, lat);
@@ -134,7 +136,8 @@ fn spawn_signal_task(
             let mut fair_up = 0.5;
             if let Some(strk) = strike_opt {
                 let t_years = years_from_secs(remaining_s.max(0) as f64);
-                fair_up = fair_up_probability(spot, strk, vol.annualized_sigma(), t_years);
+                let sigma = vol.annualized_sigma().min(cfg.vol_sigma_cap);
+                fair_up = fair_up_probability(spot, strk, sigma, t_years);
             }
 
             let liquidity_vacuum = velocity <= cfg.vacuum_velocity && obi_b <= cfg.vacuum_obi;

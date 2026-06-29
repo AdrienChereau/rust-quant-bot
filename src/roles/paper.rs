@@ -87,17 +87,21 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         let fair = price as f64;
                         last_fair = fair;
                         let gap = match side { Side::Up => fair - real_up, Side::Down => real_up - fair };
+                        let decisiveness = (real_up - 0.5).abs();
+                        let time_factor = ((300.0 - remaining_s as f64) / 300.0).clamp(0.0, 1.0);
+                        let required_gap = cfg.gap_min + cfg.gap_dynamic_k * decisiveness * time_factor;
                         let reject = if controls.is_breaker_tripped() { Some("breaker déclenché") }
                             else if controls.is_paper_paused() { Some("paper en pause") }
                             else if market.is_none() { Some("pas de marché") }
                             else if remaining_s <= cfg.end_window_block_secs { Some("fin de fenêtre") }
+                            else if real_up < cfg.price_min || real_up > cfg.price_max { Some("hors bande de prix (binaire trop décidé)") }
                             else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
-                            else if gap < cfg.gap_min { Some("gap insuffisant") }
+                            else if gap < required_gap { Some("gap insuffisant") }
                             else { None };
                         if let Some(reason) = reject {
                             tracing::info!(reason, side = side.as_str(), fair = format!("{fair:.3}"),
                                 real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
-                                gap_min = cfg.gap_min, "✗ signal rejeté (paper)");
+                                req = format!("{required_gap:.3}"), "✗ signal rejeté (paper)");
                         } else if let Some(m) = &market {
                             let (book, token) = if side == Side::Up {
                                 (&*up_book, &m.up_token_id)
