@@ -169,6 +169,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.lat_polymarket_ms = lat_snap.polymarket_ms;
             d.pm_ws_stale_ms = pm_ws_stale_ms;
             d.lat_transport_ms = last_transport_ms;
+            d.fixed_order_usd = cfg.fixed_order_usd;
         }
 
         log_throttle += 1;

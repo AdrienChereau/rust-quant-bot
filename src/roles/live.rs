@@ -374,6 +374,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             d.live_pnl = if live_mgr.state.shots > 0 { Some(live_mgr.state.realized_pnl) } else { live_pnl_val };
             d.live_shots = live_mgr.state.shots.max(live_shots);
             d.live_force_min = cfg.live_force_min_size;
+            d.fixed_order_usd = cfg.fixed_order_usd;
             d.lat_last_buy_ms = live_mgr.last_buy_ms;
             d.lat_last_sell_ms = live_mgr.last_sell_ms;
             d.pm_ws_stale_ms = pm_ws_stale_ms;

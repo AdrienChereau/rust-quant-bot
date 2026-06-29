@@ -104,7 +104,9 @@ async function refresh() {
           : '<span class="muted">— (live off)</span>';
         $("ctl_live_shots").textContent = isLive ? (s.live_shots ?? 0) : "—";
         $("ctl_armed").innerHTML = s.live_armed ? '<span class="ko">ARMÉ ⚠</span>' : '<span class="ok">non (sûr)</span>';
-        $("ctl_sizing").innerHTML = s.live_force_min
+        $("ctl_sizing").innerHTML = (s.fixed_order_usd > 0)
+          ? `<span class="ko">Fixe ${s.fixed_order_usd}$ ⚠</span>`
+          : s.live_force_min
           ? '<span class="ko">MIN forcé ⚠</span>'
           : '<span class="ok">Kelly</span>';
         const ddv = s.initial_capital != null ? (s.initial_capital - (s.equity ?? s.initial_capital)) : null;

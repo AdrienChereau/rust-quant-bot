@@ -77,6 +77,7 @@ pub struct DashState {
     pub live_pnl: Option<f64>,      // PnL réalisé live (Δ bankroll depuis activation) — None hors live
     pub live_shots: u64,            // ordres live acceptés cette session
     pub live_force_min: bool,       // LIVE_FORCE_MIN_SIZE : taille minimale forcée (agressif)
+    pub fixed_order_usd: f64,       // FIXED_ORDER_USD : notionnel fixe par ordre (0 = Kelly)
     // Métriques latence ordre live (ms)
     pub lat_last_buy_ms: Option<u64>,   // BUY FAK : début POST → réponse CLOB
     pub lat_last_sell_ms: Option<u64>,  // SELL FAK : début POST → réponse CLOB
