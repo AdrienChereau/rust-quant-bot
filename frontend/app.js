@@ -138,7 +138,9 @@ async function refresh() {
         // Giant PNL — nœud LIVE : PnL réel (Δ bankroll) ; nœud PAPER : PnL paper.
         const showLivePnl = isLiveNode && s.live_pnl != null;
         const pnlVal = showLivePnl ? s.live_pnl : s.realized_pnl;
-        $("pnl-label").textContent = showLivePnl ? "REALIZED PNL — LIVE (réel, USDC)" : "REALIZED PNL — PAPER (USDC)";
+        $("pnl-label").textContent = showLivePnl
+          ? "REALIZED PNL — LIVE (réel, USDC)"
+          : `REALIZED PNL — PAPER ${s.maker ? "MAKER" : "TAKER"} (USDC)`;
         const giantPnl = $("giant-pnl");
         giantPnl.textContent = (pnlVal >= 0 ? "+" : "") + fmt(pnlVal, 2);
         giantPnl.className = "giant-pnl " + (pnlVal > 0 ? "pos" : (pnlVal < 0 ? "neg" : ""));
