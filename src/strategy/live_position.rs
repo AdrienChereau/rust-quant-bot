@@ -108,6 +108,24 @@ impl LivePositionManager {
     pub fn position(&self) -> Option<&LivePosition> {
         if let LivePhase::Open(ref p) = self.phase { Some(p) } else { None }
     }
+
+    /// Aucune position ni ordre en cours → on peut tirer un nouveau signal.
+    pub fn is_idle(&self) -> bool { matches!(self.phase, LivePhase::Idle) }
+
+    /// Si un BUY GTC dort (PendingBuy) : (order_id, since_ms) pour gérer le timeout/cancel maker.
+    pub fn pending_buy_info(&self) -> Option<(String, u64)> {
+        if let LivePhase::PendingBuy { ref order_id, since_ms, .. } = self.phase {
+            Some((order_id.clone(), since_ms))
+        } else { None }
+    }
+
+    /// Abandonne un BUY GTC resting non rempli (timeout) → retour à Idle.
+    pub fn cancel_pending_buy(&mut self) {
+        if matches!(self.phase, LivePhase::PendingBuy { .. }) {
+            self.phase = LivePhase::Idle;
+            self.persist();
+        }
+    }
 }
 
 #[derive(Serialize)]

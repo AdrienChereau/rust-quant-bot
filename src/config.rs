@@ -54,6 +54,8 @@ pub struct Config {
     // Live testing (passage paper → réel)
     pub exec_mode: String,     // EXEC_MODE : "taker" (FAK, chemin actuel) | "maker" (GTC resting).
                                // Défaut "taker" → le live actuel est préservé, le maker est opt-in.
+    pub reward_max_spread: f64, // REWARD_MAX_SPREAD : poster l'ordre maker à ≤ ce spread du mid (bande rewards).
+    pub buy_timeout_ms: u64,    // BUY_TIMEOUT_MS : si le BUY GTC ne fill pas après ce délai → annuler + skip.
     pub max_drawdown: f64,     // circuit breaker sur l'equity (en $)
     pub live_armed: bool,      // LIVE_ARMED : verrou matériel pour l'envoi RÉEL d'ordres
     pub live_force_min_size: bool, // LIVE_FORCE_MIN_SIZE : ignore Kelly, force la taille minimale
@@ -117,6 +119,8 @@ impl Config {
             max_hold_secs: env_or("MAX_HOLD_SECS", 60),
 
             exec_mode: env::var("EXEC_MODE").unwrap_or_else(|_| "taker".into()),
+            reward_max_spread: env_or("REWARD_MAX_SPREAD", 0.03),
+            buy_timeout_ms: env_or("BUY_TIMEOUT_MS", 8000u64),
             max_drawdown: env_or("MAX_DRAWDOWN", 20.0),
             live_armed: env_or("LIVE_ARMED", false),
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),

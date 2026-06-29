@@ -187,17 +187,24 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                 (&*down_book, &m.down_token_id)
                             };
                             let edge = gap;
-                            if live_mgr.position().is_some() || !pending_opens.is_empty() {
-                                tracing::info!(reason = "position live déjà ouverte/pending", "✗ ordre live ignoré");
+                            if !live_mgr.is_idle() || !pending_opens.is_empty() {
+                                tracing::info!(reason = "position/ordre live déjà en cours", "✗ ordre live ignoré");
                             } else {
                                 match (live_bankroll_val, engine_tx.as_ref()) {
                                     (None, _) => tracing::warn!("bankroll pas encore lue — tir ignoré"),
                                     (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
                                     (Some(bk), Some(engine)) => {
-                                        // Achat à ask + marge : garantit le match FAK malgré le mouvement
-                                        // du prix pendant le round-trip. La FAK price-improve → on paie
-                                        // quand même le vrai ask, la marge ne sert qu'à matcher.
-                                        let order_price = (book.best_ask().unwrap_or(real_up) + cfg.entry_buffer).min(0.99);
+                                        // MAKER : on POSTE un GTC au bid (capte le spread) dans la bande
+                                        // rewards du mid → dort dans le carnet, pas de FAK no-match.
+                                        // TAKER : FAK à ask + marge (garantit le match malgré le mouvement).
+                                        let (order_price, kind) = if maker_mode {
+                                            let bid = book.best_bid().unwrap_or(real_up);
+                                            let ask = book.best_ask().unwrap_or(real_up);
+                                            let mid = (bid + ask) / 2.0;
+                                            (bid.max(mid - cfg.reward_max_spread).clamp(0.01, 0.99), OrderKind::Gtc)
+                                        } else {
+                                            ((book.best_ask().unwrap_or(real_up) + cfg.entry_buffer).min(0.99), OrderKind::Fak)
+                                        };
                                         let sized = if cfg.fixed_order_usd > 0.0 {
                                             // Notionnel fixe ($) — Kelly ignoré ; plancher = min d'échange.
                                             Some((cfg.fixed_order_usd / order_price).floor().max(m.min_order_size))
@@ -223,7 +230,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                                 let cmd = OrderCmd::Open {
                                                     side, token_id: token.clone(), neg_risk: m.neg_risk,
                                                     price: order_price, size, tick: m.tick_size,
-                                                    min_order_size: m.min_order_size, kind: OrderKind::Fak, reply: tx,
+                                                    min_order_size: m.min_order_size, kind, reply: tx,
                                                 };
                                                 if engine.try_send(cmd).is_ok() {
                                                     pending_opens.push(PendingOpen {
@@ -234,7 +241,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                                     last_fire_ms = now_ms;
                                                     last_transport_ms = Some(transport_ms);
                                                     last_decide_ms = Some(recv_instant.elapsed().as_millis() as u64);
-                                                    tracing::info!(side = side.as_str(), price = order_price, size,
+                                                    tracing::info!(mode = if maker_mode {"MAKER GTC"} else {"TAKER FAK"},
+                                                        side = side.as_str(), price = order_price, size,
                                                         transport_ms, "⚡ BUY soumis à OrderEngine");
                                                 } else {
                                                     tracing::warn!("OrderEngine plein — tir ignoré");
@@ -329,6 +337,20 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
                 Err(_) => { pending_close = None; }
+            }
+        }
+
+        // ── Maker : un BUY GTC qui dort trop longtemps sans fill → annuler + revenir Idle ──
+        if maker_mode {
+            if let Some((buy_id, since_ms)) = live_mgr.pending_buy_info() {
+                if now_ms.saturating_sub(since_ms) >= cfg.buy_timeout_ms {
+                    if let Some(engine) = engine_tx.as_ref() {
+                        let (tx, _rx) = oneshot::channel();
+                        let _ = engine.try_send(OrderCmd::Cancel { order_id: buy_id.clone(), reply: tx });
+                    }
+                    tracing::info!(order_id = %buy_id, "🗑 BUY GTC non rempli (timeout) — annulation + skip");
+                    live_mgr.cancel_pending_buy();
+                }
             }
         }
 
