@@ -51,8 +51,10 @@ pub struct Config {
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
     pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties SL/max_hold
                                    // (garantit le fill de la vente ; la FAK price-improve).
-    pub min_hold_ms: u64,          // MIN_HOLD_MS : détention min avant SL/TP — couvre le settlement
-                                   // on-chain (~2-4 s) + évite le SL instantané sur le spread d'entrée.
+    pub min_hold_ms: u64,          // MIN_HOLD_MS : détention min avant SL (laisse le move se faire,
+                                   // n'abandonne pas sur le spread d'entrée).
+    pub min_hold_tp_ms: u64,       // MIN_HOLD_TP_MS : détention min avant TP — juste le settlement
+                                   // on-chain (TP dès que la position est VENDABLE, le plus tôt possible).
 
     // Infrastructure live (Bloc D)
     pub pm_ws_stale_threshold_ms: u64, // skip REST book si WS < ce seuil (ms)
@@ -100,6 +102,7 @@ impl Config {
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
             min_hold_ms: env_or("MIN_HOLD_MS", 3000u64),
+            min_hold_tp_ms: env_or("MIN_HOLD_TP_MS", 2000u64),
 
             pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),
             bankroll_poll_secs: env_or("BANKROLL_POLL_SECS", 10u64),

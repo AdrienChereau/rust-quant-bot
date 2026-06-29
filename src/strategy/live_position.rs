@@ -29,6 +29,10 @@ use crate::polymarket::order_engine::OrderResult;
 use crate::polymarket::relayer::PolyBook;
 use crate::strategy::bankroll::KellyParams;
 
+/// Au-delà de ce délai après l'ouverture, un `balance: 0` n'est plus du settlement on-chain
+/// (BUY pas encore réglé) mais une position réellement disparue → abandon autorisé.
+const SETTLE_GRACE_MS: u64 = 5000;
+
 /// État cumulé du trading live (compteurs + PnL réalisé). Persisté sur disque.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiveState {
@@ -308,8 +312,10 @@ impl LivePositionManager {
         }
     }
 
-    /// Callback SELL depuis OrderEngine.
-    pub fn on_sell_result(&mut self, res: OrderResult, reason: &str) {
+    /// Callback SELL depuis OrderEngine. `now_ms` sert à distinguer un `balance: 0` de
+    /// settlement (BUY pas encore réglé on-chain → ré-essai) d'une position vraiment disparue
+    /// (fermée à la main / réglée à l'expiration → abandon).
+    pub fn on_sell_result(&mut self, res: OrderResult, reason: &str, now_ms: u64) {
         match res {
             OrderResult::Placed { order_id, filled_size, avg_price, post_ms, .. } => {
                 self.last_sell_ms = Some(post_ms);
@@ -334,16 +340,25 @@ impl LivePositionManager {
             OrderResult::Failed { error, .. } => {
                 self.state.failed_closes += 1;
                 self.consec_close_fails += 1;
-                // "balance not enough / balance: 0" → la position n'existe plus on-chain
-                // (réglée à l'expiration de la fenêtre 5 min, ou jamais détenue). Inutile de
-                // réessayer : on abandonne pour ne pas spammer le CLOB en boucle (50 ms).
-                let gone = error.to_lowercase().contains("balance");
-                if gone || self.consec_close_fails >= 5 {
-                    tracing::error!(error = %error, reason, consec = self.consec_close_fails,
-                        "🛑 position abandonnée (introuvable on-chain) — phase → Idle, voir bankroll");
+                let no_balance = error.to_lowercase().contains("balance");
+                // Temps écoulé depuis l'ouverture : sous SETTLE_GRACE_MS, un `balance: 0` signifie
+                // que le BUY n'est PAS encore réglé on-chain → la position arrive, on garde et on
+                // ré-essaie (ne JAMAIS abandonner une position qu'on détient vraiment).
+                let held_ms = match &self.phase {
+                    LivePhase::Open(p) => now_ms.saturating_sub(p.opened_ms),
+                    _ => u64::MAX,
+                };
+                let settled = held_ms >= SETTLE_GRACE_MS;
+                if settled && (no_balance || self.consec_close_fails >= 5) {
+                    // Réglé ET toujours introuvable → fermée à la main / réglée à l'expiration → abandon.
+                    tracing::error!(error = %error, reason, held_ms,
+                        "🛑 position abandonnée (introuvable on-chain après settlement) — phase → Idle, voir bankroll");
                     self.phase = LivePhase::Idle;
                     self.state.losses += 1;
                     self.consec_close_fails = 0;
+                } else if no_balance {
+                    tracing::warn!(reason, held_ms,
+                        "⏳ SELL en attente — BUY pas encore réglé on-chain (settlement), ré-essai");
                 } else {
                     tracing::error!(error = %error, reason, consec = self.consec_close_fails,
                         "❌ SELL live échoué (OrderEngine) — ré-essai au prochain tick");
@@ -539,7 +554,7 @@ mod tests {
         m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
                 post_ms: 30, is_sell: true, reason: Some("take_profit") },
-            "take_profit",
+            "take_profit", 1000,
         );
         assert!(matches!(m.phase, LivePhase::PendingSell { .. }), "doit être PendingSell, got {:?}", m.phase);
         let _ = fs::remove_file("/tmp/live_state_test_phase_c.json");
@@ -572,7 +587,7 @@ mod tests {
         m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
                 post_ms: 30, is_sell: true, reason: Some("stop_loss") },
-            "stop_loss",
+            "stop_loss", 1000,
         );
         // apply_close sans fill : ne doit pas clôturer.
         m.apply_close("o2".into(), None, None, "stop_loss");
