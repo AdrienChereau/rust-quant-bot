@@ -491,6 +491,61 @@ pub async fn sync_balance_allowance(creds: &LiveCredentials) -> anyhow::Result<(
     Ok(())
 }
 
+/// Rafraîchit le cache **CONDITIONAL** (outcome tokens) d'un `token_id` précis.
+/// `GET /balance-allowance/update?asset_type=CONDITIONAL&token_id=..&signature_type=N`
+///
+/// INDISPENSABLE POUR VENDRE. La doc Polymarket impose d'approuver/rafraîchir DEUX assets : le
+/// collatéral (USDC, pour acheter) ET les conditional tokens (pour vendre). Après un BUY, le cache
+/// CONDITIONAL du token reste périmé à 0 tant qu'on ne le rafraîchit pas → le moteur de matching
+/// rejette le SELL « not enough balance » alors qu'on détient bien les tokens. C'est LA cause de
+/// « on rentre sur les ordres mais on n'arrive pas à en sortir ». À appeler dès l'adoption d'une
+/// position (hors hot-loop, en task) pour débloquer la revente.
+pub async fn sync_conditional_allowance(creds: &LiveCredentials, token_id: &str) -> anyhow::Result<()> {
+    const SIGN_PATH: &str = "/balance-allowance/update";
+    let query = format!("asset_type=CONDITIONAL&token_id={token_id}&signature_type={}", creds.sig_type);
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
+    // HMAC : on signe le PATH sans query (parité py-clob-client), query dans l'URL seulement.
+    let headers = build_l2_headers(creds, &ts, "GET", SIGN_PATH, "")?;
+    let mut req = HTTP.clone().get(format!("{CLOB_BASE}{SIGN_PATH}?{query}"));
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("CLOB /balance-allowance/update CONDITIONAL {status}: {text}");
+    }
+    tracing::info!(token_id, "cache CONDITIONAL CLOB synchronisé (SELL débloqué)");
+    Ok(())
+}
+
+/// Lit la balance **CONDITIONAL** (nb d'outcome tokens détenus) d'un `token_id` via le CLOB.
+/// `GET /balance-allowance?asset_type=CONDITIONAL&token_id=..&signature_type=N`.
+/// Source de vérité serveur du solde réel à vendre (sizing exact d'un SELL, anti-poussière).
+pub async fn get_conditional_balance(creds: &LiveCredentials, token_id: &str) -> anyhow::Result<f64> {
+    const SIGN_PATH: &str = "/balance-allowance";
+    let query = format!("asset_type=CONDITIONAL&token_id={token_id}&signature_type={}", creds.sig_type);
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs().to_string();
+    let headers = build_l2_headers(creds, &ts, "GET", SIGN_PATH, "")?;
+    let mut req = HTTP.clone().get(format!("{CLOB_BASE}{SIGN_PATH}?{query}"));
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("CLOB /balance-allowance CONDITIONAL {status}: {text}");
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("conditional balance JSON '{text}': {e}"))?;
+    let raw = v.get("balance").and_then(|b| b.as_str())
+        .ok_or_else(|| anyhow::anyhow!("champ 'balance' absent: {text}"))?;
+    let base: f64 = raw.parse().map_err(|e| anyhow::anyhow!("balance '{raw}': {e}"))?;
+    Ok(base / BASE_UNITS)
+}
+
 /// Appelé au démarrage mono/executor : vérifie creds + sync cache si deposit wallet.
 /// Propage l'échec de la sync (deposit wallet sig_type=3) pour que l'appelant décide d'arrêter
 /// plutôt que de trader avec un cache de balance potentiellement périmé.

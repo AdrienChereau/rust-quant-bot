@@ -13,6 +13,10 @@ use polymarket_client_sdk_v2::{POLYGON};
 
 use super::live_executor::{LiveCredentials, OrderArgs, OrderKind, PlaceResult, CLOB_BASE};
 
+/// Décimales de la taille d'ordre = grille on-chain Polymarket (montants en base units 1e6).
+/// On tronque la taille à cette précision (jamais au-dessus) → revente exacte du fill, zéro poussière.
+const SIZE_DECIMALS: u32 = 6;
+
 // ─── Caches pré-chargés au démarrage (startup_poly) ────────────────────────────────────────────
 
 /// LocalSigner pré-parsé — évite de décoder la clé hex à chaque ordre POLY_1271.
@@ -156,7 +160,10 @@ pub async fn place_order_poly1271(
     let price = decimal_from_f64(args.price, price_dp, false, "price")?;
     // Taille : TRONQUÉE vers le bas (jamais arrondie au-dessus). Sinon une position de 4,995787
     // détenue serait arrondie à 5,00 → POST rejeté "not enough balance" (on vendrait plus qu'on a).
-    let size = decimal_from_f64(args.size, 2, true, "size")?; // lot max 2 décimales (SDK)
+    // Précision = grille on-chain réelle (base units 1e6 → 6 décimales). Tronquer à 2 décimales
+    // laissait de la poussière non vendable : un fill de 2,09472 partait en 2,09 → reliquat
+    // 0,00472 jamais soldé. À 6 décimales on revend EXACTEMENT le fill (floor = jamais d'oversell).
+    let size = decimal_from_f64(args.size, SIZE_DECIMALS, true, "size")?;
     let _ = neg_risk_val;
     let side = if args.is_sell { Side::Sell } else { Side::Buy };
 
@@ -316,6 +323,34 @@ fn map_signature_type(sig_type: u8) -> SignatureType {
         2 => SignatureType::GnosisSafe,
         3 => SignatureType::Poly1271,
         _ => SignatureType::GnosisSafe,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr as _;
+
+    #[test]
+    fn size_floor_keeps_six_decimals_no_dust() {
+        // Bug dust : un fill réel de 2,09472 doit être revendu EXACTEMENT (avant le fix, tronqué à 2
+        // décimales = 2,09 → reliquat 0,00472 invendable bloquant la position).
+        let d = decimal_from_f64(2.09472, SIZE_DECIMALS, true, "size").unwrap();
+        assert_eq!(d.to_string(), "2.09472");
+    }
+
+    #[test]
+    fn size_floor_never_oversells() {
+        // Troncature stricte vers le bas → jamais au-dessus du détenu (anti "not enough balance").
+        let d = decimal_from_f64(4.9999999, SIZE_DECIMALS, true, "size").unwrap();
+        assert_eq!(d, Decimal::from_str("4.999999").unwrap());
+        assert!(d <= Decimal::from_f64_retain(4.9999999).unwrap());
+    }
+
+    #[test]
+    fn price_rounds_to_tick_dp() {
+        let p = decimal_from_f64(0.05, 2, false, "price").unwrap();
+        assert_eq!(p.to_string(), "0.05");
     }
 }
 

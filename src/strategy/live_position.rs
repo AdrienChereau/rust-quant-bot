@@ -59,6 +59,14 @@ pub struct LivePosition {
     /// multi-trades). `serde(default)` = 0.0 pour les états persistés avant ce champ.
     #[serde(default)]
     pub tick: f64,
+    /// Cumul d'achat réel (source = poll serveur du BUY), **monotone croissant**. La réconciliation
+    /// d'achat se cale dessus — JAMAIS sur `size` — sinon une vente partielle (qui baisse `size`)
+    /// serait « ressuscitée » par le poll au cumul d'achat. `size = bought - sold` (net vendable).
+    #[serde(default)]
+    pub bought: f64,
+    /// Cumul de vente réalisé sur cette position. `size = bought - sold`.
+    #[serde(default)]
+    pub sold: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,7 +394,11 @@ impl LivePositionManager {
     /// Callback SELL depuis OrderEngine. `now_ms` sert à distinguer un `balance: 0` de
     /// settlement (BUY pas encore réglé on-chain → ré-essai) d'une position vraiment disparue
     /// (fermée à la main / réglée à l'expiration → abandon).
-    pub fn on_sell_result(&mut self, res: OrderResult, reason: &str, now_ms: u64, min_order_size: f64) {
+    /// Retourne `true` si l'appelant doit rafraîchir le cache **CONDITIONAL** du token (le SELL a
+    /// été rejeté « balance 0 », souvent un cache d'allowance périmé après le BUY — pas une position
+    /// disparue). L'appelant lance alors `sync_conditional_allowance(token_id)` hors hot-loop.
+    #[must_use]
+    pub fn on_sell_result(&mut self, res: OrderResult, reason: &str, now_ms: u64, min_order_size: f64) -> bool {
         match res {
             OrderResult::Placed { order_id, filled_size, avg_price, post_ms, .. } => {
                 self.last_sell_ms = Some(post_ms);
@@ -403,7 +415,9 @@ impl LivePositionManager {
                                 let pnl = (got - entry) * n;
                                 self.state.realized_pnl += pnl;
                                 self.append("close_partial", &side, got, n, pnl, &order_id);
-                                if let LivePhase::Open(ref mut p) = self.phase { p.size = pos_size - n; }
+                                if let LivePhase::Open(ref mut p) = self.phase {
+                                    p.sold += n; p.size = (p.bought - p.sold).max(0.0);
+                                }
                                 self.consec_close_fails = 0;
                                 self.persist();
                                 tracing::warn!(sold = n, remaining = pos_size - n,
@@ -448,49 +462,58 @@ impl LivePositionManager {
                             if p.size > held + 1e-9 {
                                 tracing::warn!(suivi = p.size, detenu = held,
                                     "⚠️ taille suivie > solde réel — recalée sur le solde serveur (anti-oversell)");
+                                // Garde l'invariant size = bought - sold (le serveur fait foi sur le net).
+                                p.sold = (p.bought - held).max(0.0);
                                 p.size = held;
                             }
                         }
                         tracing::warn!(reason, detenu = held, consec = self.consec_close_fails,
                             "❌ SELL rejeté (solde détenu > 0) — taille recalée, ré-essai (JAMAIS d'abandon tant qu'on détient)");
                         self.persist();
-                        return;
+                        return false; // le cache voit nos tokens → inutile de le rafraîchir
                     }
                 }
-                // Temps écoulé depuis l'ouverture : sous SETTLE_GRACE_MS, un `balance: 0` signifie
-                // que le BUY n'est PAS encore réglé on-chain → la position arrive, on garde et on
-                // ré-essaie (ne JAMAIS abandonner une position qu'on détient vraiment).
                 let held_ms = match &self.phase {
                     LivePhase::Open(p) => now_ms.saturating_sub(p.opened_ms),
                     _ => u64::MAX,
                 };
                 let settled = held_ms >= SETTLE_GRACE_MS;
-                // On n'abandonne QUE si le solde est réellement ~0 (balance: 0 OU pas de solde dans
-                // l'erreur) APRÈS settlement : seul signal fiable que la position est partie (vendue à
-                // la main / réglée à l'expiration). Sinon on re-tente jusqu'au rollover (resolve_expired).
-                if settled && no_balance && held_tokens.map_or(true, |h| h <= 0.0) {
+                // `balance: 0` (ou absent) n'est PAS une preuve de position disparue : le plus souvent
+                // c'est le cache d'allowance CONDITIONAL périmé (pas rafraîchi après le BUY) OU le BUY
+                // pas encore réglé on-chain. On demande un REFRESH du cache (retour `true`) et on
+                // ré-essaie. On n'ABANDONNE qu'après settlement ET plusieurs échecs (cache déjà
+                // rafraîchi, vrai 0) — sinon on jetait une position qu'on détient (« on perd l'ordre »).
+                if no_balance && held_tokens.map_or(true, |h| h <= 0.0) {
+                    if !settled || self.consec_close_fails < 3 {
+                        tracing::warn!(reason, held_ms, consec = self.consec_close_fails,
+                            "⏳ SELL « balance 0 » — refresh cache CONDITIONAL + ré-essai (cache périmé ou settlement)");
+                        self.persist();
+                        return true;
+                    }
                     tracing::error!(error = %error, reason, held_ms,
-                        "🛑 position introuvable on-chain après settlement (balance=0) — phase → Idle, voir bankroll");
+                        "🛑 position introuvable on-chain après refresh+settlement (balance=0) — phase → Idle, voir bankroll");
                     self.phase = LivePhase::Idle;
                     self.state.losses += 1;
                     self.consec_close_fails = 0;
-                } else if no_balance {
-                    tracing::warn!(reason, held_ms,
-                        "⏳ SELL en attente — BUY pas encore réglé on-chain (settlement), ré-essai");
+                    self.http_filled_buy_id = None;
+                    self.persist();
+                    return false;
+                }
+                // Erreur non-`balance` : on garde la position et on ré-essaie. Au-delà de 5 échecs
+                // d'affilée on alerte fort (carnet vide ? ordre malformé ?) sans JAMAIS abandonner.
+                if self.consec_close_fails >= 5 {
+                    tracing::error!(error = %error, reason, consec = self.consec_close_fails, held_ms,
+                        "🚨 SELL échoue en boucle (position TOUJOURS détenue) — ré-essai jusqu'au rollover, vérifier le carnet");
                 } else {
-                    // Erreur non-`balance` : on garde la position et on ré-essaie. Au-delà de 5 échecs
-                    // d'affilée on alerte fort (carnet vide ? ordre malformé ?) sans JAMAIS abandonner.
-                    if self.consec_close_fails >= 5 {
-                        tracing::error!(error = %error, reason, consec = self.consec_close_fails, held_ms,
-                            "🚨 SELL échoue en boucle (position TOUJOURS détenue) — ré-essai jusqu'au rollover, vérifier le carnet");
-                    } else {
-                        tracing::error!(error = %error, reason, consec = self.consec_close_fails,
-                            "❌ SELL live échoué (OrderEngine) — ré-essai au prochain tick");
-                    }
+                    tracing::error!(error = %error, reason, consec = self.consec_close_fails,
+                        "❌ SELL live échoué (OrderEngine) — ré-essai au prochain tick");
                 }
                 self.persist();
+                return false;
             }
         }
+        // Placé/DryRun/Cancelled : aucun rejet « balance », pas de refresh à demander.
+        false
     }
 
     /// Confirmation WS d'un fill SELL — clôture proprement. Conservé (tests + réconciliation
@@ -530,7 +553,8 @@ impl LivePositionManager {
                 LivePhase::PendingSell { position, .. } => position,
                 _ => unreachable!("pos_size venait d'Open/PendingSell"),
             };
-            pos.size = pos_size - n;
+            pos.sold += n;
+            pos.size = (pos.bought - pos.sold).max(0.0);
             tracing::warn!(sold = n, remaining = pos.size, pnl = format!("{pnl:.2}"),
                 "↩ SELL partiel (WS) — on re-vend le reste");
             self.phase = LivePhase::Open(pos);
@@ -599,16 +623,21 @@ impl LivePositionManager {
                 self.open_position(side, &token_id, neg_risk, price, server_filled, tick, order_id, now_ms);
             }
             LivePhase::Open(mut p) if order_id == p.buy_order_id => {
-                // On ne grossit que si le serveur voit STRICTEMENT plus (tolérance dust) → idempotent.
-                if server_filled > p.size + 1e-6 {
-                    let added = server_filled - p.size;
+                // On compare au cumul d'ACHAT (`bought`), pas à `size` : sinon une vente partielle
+                // (qui a baissé `size`) serait ressuscitée jusqu'au cumul d'achat → on re-détiendrait
+                // ce qu'on vient de vendre. On ne grossit que si le serveur voit STRICTEMENT plus
+                // d'ACHAT qu'enregistré (tolérance dust) → idempotent.
+                if server_filled > p.bought + 1e-6 {
+                    let added = server_filled - p.bought;
                     let tick = if p.tick > 0.0 { p.tick } else { 0.01 };
-                    p.entry_price = (p.entry_price * p.size + price * added) / server_filled;
-                    p.size = server_filled;
+                    p.entry_price = (p.entry_price * p.bought + price * added) / server_filled;
+                    p.bought = server_filled;
+                    p.size = (p.bought - p.sold).max(0.0); // net vendable (ne ressuscite pas les ventes)
                     p.tp_price = round_tick((p.entry_price + self.params.tp_cents / 100.0).min(0.99), tick);
                     p.sl_price = round_tick((p.entry_price - self.params.sl_cents / 100.0).max(0.01), tick);
-                    tracing::warn!(order_id, added, size = server_filled, entry = format!("{:.3}", p.entry_price),
-                        "➕ poll serveur : position calée sur le cumulatif réel (anti-orpheline)");
+                    tracing::warn!(order_id, added, bought = server_filled, size = p.size,
+                        entry = format!("{:.3}", p.entry_price),
+                        "➕ poll serveur : achat calé sur le cumulatif réel (net vendable préservé)");
                     self.append("reconcile_grow", p.side.as_str(), price, added, 0.0, order_id);
                     self.phase = LivePhase::Open(p);
                     self.persist();
@@ -636,6 +665,7 @@ impl LivePositionManager {
             side, token_id: token_id.to_string(), entry_price: entry, size: filled,
             tp_price: tp, sl_price: sl, opened_ms: now_ms, neg_risk,
             buy_order_id: order_id.to_string(), tick,
+            bought: filled, sold: 0.0,
         };
         self.append("open", side.as_str(), entry, filled, 0.0, order_id);
         tracing::warn!(side = side.as_str(), token_id, entry = format!("{entry:.3}"),
@@ -652,7 +682,8 @@ impl LivePositionManager {
         if pnl >= 0.0 { self.state.wins += 1 } else { self.state.losses += 1 }
         let kind = match reason {
             "take_profit" => "close_tp", "stop_loss" => "close_sl",
-            "expired" => "close_expired", _ => "close_max_hold",
+            "expired" => "close_expired", "window_close" => "close_window",
+            _ => "close_max_hold",
         };
         self.append(kind, side, got_price, sold, pnl, &order_id);
         tracing::warn!(reason, exit = format!("{got_price:.3}"), pnl = format!("{pnl:.2}"),
@@ -875,7 +906,7 @@ mod tests {
         );
         assert!(matches!(m.phase, LivePhase::Open(_)));
         // SELL sans fill.
-        m.on_sell_result(
+        let _ = m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
                 post_ms: 30 },
             "take_profit", 1000, 5.0,
@@ -908,7 +939,7 @@ mod tests {
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
         // Force PendingSell.
-        m.on_sell_result(
+        let _ = m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None,
                 post_ms: 30 },
             "stop_loss", 1000, 5.0,
@@ -941,11 +972,60 @@ mod tests {
         assert!(matches!(m.phase, LivePhase::Open(_)));
         // SELL rejeté : le serveur dit qu'on détient 4.995787 (held_ms grand = settled).
         let err = "the balance is not enough -> balance: 4995787, order amount: 5000000".to_string();
-        m.on_sell_result(OrderResult::Failed { error: err }, "stop_loss", 60_000, 5.0);
+        let _ = m.on_sell_result(OrderResult::Failed { error: err }, "stop_loss", 60_000, 5.0);
         match &m.phase {
             LivePhase::Open(p) => assert!((p.size - 4.995787).abs() < 1e-6,
                 "taille recalée sur le solde réel, got {}", p.size),
             other => panic!("doit RESTER Open (jamais abandon tant qu'on détient), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sell_balance_zero_asks_refresh_and_keeps_position() {
+        // « balance 0 » au SELL = cache CONDITIONAL périmé (pas une position perdue). on_sell_result
+        // doit DEMANDER un refresh (true) et GARDER la position, jamais l'abandonner d'emblée.
+        let mut m = mgr_named("sell_balance_zero_refresh");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "b1".into(), filled_size: Some(5.0), avg_price: Some(0.30), post_ms: 50 },
+            Side::Up, "tok", false, 0.30, 5.0, 0.01, 1000,
+        );
+        let err = "the balance is not enough -> balance: 0, order amount: 5000000".to_string();
+        // Même APRÈS settlement, le 1er échec demande un refresh et conserve la position.
+        let need = m.on_sell_result(OrderResult::Failed { error: err.clone() }, "stop_loss", 60_000, 5.0);
+        assert!(need, "doit demander un refresh CONDITIONAL");
+        assert!(matches!(m.phase, LivePhase::Open(_)), "ne PAS abandonner au 1er balance:0, got {:?}", m.phase);
+        // Échecs répétés post-settlement (cache rafraîchi, vrai 0) → abandon contrôlé.
+        let _ = m.on_sell_result(OrderResult::Failed { error: err.clone() }, "stop_loss", 60_000, 5.0);
+        let _ = m.on_sell_result(OrderResult::Failed { error: err }, "stop_loss", 60_000, 5.0);
+        assert!(m.is_idle(), "après 3 échecs settled (vrai 0), abandon contrôlé, got {:?}", m.phase);
+    }
+
+    #[test]
+    fn buy_poll_does_not_resurrect_after_partial_sell() {
+        // CŒUR DU FIX anti-emmêlage : achat 10, vente partielle 6 → net 4. Un poll d'achat re-livrant
+        // le cumul d'achat (10) ne DOIT PAS regonfler la position (sinon on re-détient le vendu).
+        let mut m = mgr_named("no_resurrect_after_partial");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "g1".into(), filled_size: Some(10.0), avg_price: Some(0.50), post_ms: 50 },
+            Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
+        );
+        // Vente partielle de 6 (min_order_size 1 → reste 4 ≥ 1 = re-vendable).
+        let _ = m.on_sell_result(
+            OrderResult::Placed { order_id: "s1".into(), filled_size: Some(6.0), avg_price: Some(0.55), post_ms: 30 },
+            "take_profit", 1100, 1.0,
+        );
+        match &m.phase {
+            LivePhase::Open(p) => assert!((p.size - 4.0).abs() < 1e-9, "net 4 après vente, got {}", p.size),
+            o => panic!("doit rester Open, got {o:?}"),
+        }
+        // Poll d'achat : cumul d'achat 10 re-livré → net INCHANGÉ (4), surtout pas 10.
+        m.reconcile_buy_to_server("g1", 10.0, 0.50, 1200);
+        match &m.phase {
+            LivePhase::Open(p) => {
+                assert!((p.size - 4.0).abs() < 1e-9, "le poll ne ressuscite pas la vente, got size {}", p.size);
+                assert!((p.bought - 10.0).abs() < 1e-9, "bought reste le cumul d'achat 10, got {}", p.bought);
+            }
+            o => panic!("doit rester Open, got {o:?}"),
         }
     }
 
@@ -959,7 +1039,7 @@ mod tests {
                 post_ms: 50 },
             Side::Up, "tok", false, 0.50, 10.0, 0.01, 1000,
         );
-        m.on_sell_result(
+        let _ = m.on_sell_result(
             OrderResult::Placed { order_id: "o2".into(), filled_size: None, avg_price: None, post_ms: 30 },
             "stop_loss", 5_000, 5.0,
         );

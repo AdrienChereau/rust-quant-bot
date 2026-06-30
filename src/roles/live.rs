@@ -26,6 +26,12 @@ use crate::state::RuntimeControls;
 use crate::strategy::bankroll::{self, KellyParams};
 use crate::strategy::live_position::LivePositionManager;
 
+/// Secondes restantes sous lesquelles une position est **flattenée d'office** (on ne peut pas tenir
+/// au-delà de la résolution de la fenêtre 5 min). En miroir : on n'OUVRE plus et on annule tout BUY
+/// GTC qui dort sous ce seuil — sinon un maker rempli à ~20s de la fin était instantanément dumpé à
+/// perte (le bug "max_hold à la même milliseconde que le fill").
+const FORCE_EXIT_REMAINING_S: i64 = 30;
+
 /// Contexte d'un BUY en attente de confirmation par l'OrderEngine.
 struct PendingOpen {
     rx: oneshot::Receiver<OrderResult>,
@@ -157,9 +163,17 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut last_sweep_ms: u64 = 0; // dernier balayage anti-orpheline (maker + Idle)
     let mut last_status_poll_ms: u64 = 0; // dernier poll de statut d'ordre (PendingBuy)
     let mut last_sell_attempt_ms: u64 = 0; // throttle des re-tentatives de SELL (anti-spam 50 ms)
-    // Réconciliation par PULL : un poll serveur (get_order_status) renvoie ici (order_id, size, price)
-    // dès qu'un ordre suivi a réellement rempli — indépendant du WebSocket (filet anti-orpheline).
-    let (recon_tx, mut recon_rx) = mpsc::unbounded_channel::<(String, f64, f64)>();
+    // Token dont le cache d'allowance CONDITIONAL a déjà été rafraîchi pour la position courante.
+    // Sans ce refresh, le CLOB voit 0 token outcome après le BUY → tout SELL est rejeté « balance 0 »
+    // (on rentre mais on ne sort pas). On le fait UNE fois par position, dès l'adoption (hors hot-loop).
+    let mut conditional_synced_token: Option<String> = None;
+    // Le BUY suivi est totalement MATCHED → plus aucun fill à venir : on ARRÊTE de le poller (sinon
+    // un GET CLOB inutile toutes les 1,5 s pendant toute la détention). Remis à false à chaque BUY.
+    let mut buy_poll_done = false;
+    // Réconciliation par PULL : un poll serveur (get_order_status) renvoie ici (order_id, size, price,
+    // terminal) dès qu'un ordre suivi a réellement rempli — indépendant du WebSocket (anti-orpheline).
+    // `terminal` = l'ordre est entièrement MATCHED (plus de croissance possible → on coupe le poll).
+    let (recon_tx, mut recon_rx) = mpsc::unbounded_channel::<(String, f64, f64, bool)>();
 
     tracing::info!("🔄 boucle live démarrée — tick 50 ms actif");
     loop {
@@ -187,7 +201,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         let reject = if controls.is_breaker_tripped() { Some("breaker déclenché") }
                             else if !controls.live_active() { Some("live en pause") }
                             else if market.is_none() { Some("pas de marché") }
-                            else if remaining_s <= cfg.end_window_block_secs { Some("fin de fenêtre") }
+                            // Bloque l'entrée dès qu'on est dans la zone de flatten forcé : ouvrir là
+                            // = sortie forcée immédiate à perte. Cohérent avec le forced-exit (§2).
+                            else if remaining_s <= cfg.end_window_block_secs.max(FORCE_EXIT_REMAINING_S) { Some("fin de fenêtre (flatten imminent)") }
                             else if real_up < cfg.price_min || real_up > cfg.price_max { Some("hors bande de prix (binaire trop décidé)") }
                             else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
                             else if gap < required_gap { Some("gap insuffisant") }
@@ -255,6 +271,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                                         neg_risk: m.neg_risk, order_price, size,
                                                         tick: m.tick_size, now_ms,
                                                     });
+                                                    buy_poll_done = false; // nouveau BUY → re-arme le poll de statut
                                                     last_fire_ms = now_ms;
                                                     last_transport_ms = Some(transport_ms);
                                                     last_decide_ms = Some(recv_instant.elapsed().as_millis() as u64);
@@ -327,8 +344,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         // Réconciliation par PULL : le poll serveur a confirmé qu'un ordre suivi a rempli (le WS a
         // pu rater le fill). On adopte la position → Open, même sans event WS. C'est LE filet qui
         // garantit qu'on sait qu'on est rentré (et donc qu'on revend) tant qu'on tient l'order_id.
-        while let Ok((oid, server_filled, price)) = recon_rx.try_recv() {
+        while let Ok((oid, server_filled, price, terminal)) = recon_rx.try_recv() {
             live_mgr.reconcile_buy_to_server(&oid, server_filled, price, now_ms);
+            // Ordre entièrement MATCHED et c'est bien le BUY qu'on suit → inutile de re-poller.
+            if terminal && live_mgr.tracked_buy_order_id().as_deref() == Some(oid.as_str()) {
+                buy_poll_done = true;
+            }
         }
 
         // ── 1. Drain résultats OrderEngine ────────────────────────────────────────────
@@ -347,12 +368,47 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             match r.try_recv() {
                 Ok(res) => {
                     let min_os = market.as_ref().map(|m| m.min_order_size).unwrap_or(5.0);
-                    live_mgr.on_sell_result(res, reason, now_ms, min_os);
+                    let needs_cond_refresh = live_mgr.on_sell_result(res, reason, now_ms, min_os);
+                    // SELL rejeté « balance 0 » → cache CONDITIONAL probablement périmé : on le
+                    // rafraîchit (hors hot-loop) pour débloquer la prochaine tentative de revente.
+                    if needs_cond_refresh && cfg.live_armed {
+                        if let (Some(creds), Some(tok)) =
+                            (live_creds.clone(), live_mgr.position().map(|p| p.token_id.clone()))
+                        {
+                            tokio::spawn(async move {
+                                if let Err(e) = live_executor::sync_conditional_allowance(&creds, &tok).await {
+                                    tracing::warn!(error = %e, "⚠️ refresh cache CONDITIONAL (post-rejet SELL) échoué");
+                                }
+                            });
+                        }
+                    }
                     pending_close = None;
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
                 Err(_) => { pending_close = None; }
             }
+        }
+
+        // ── Refresh CONDITIONAL à l'adoption d'une position (débloque le SELL) ────────────────
+        // Dès qu'on détient un token (Open), on rafraîchit UNE fois le cache d'allowance CONDITIONAL
+        // du CLOB pour ce token : sinon le moteur de matching voit 0 et rejette toute revente.
+        match live_mgr.position().map(|p| p.token_id.clone()) {
+            Some(tok) => {
+                if conditional_synced_token.as_deref() != Some(tok.as_str()) {
+                    conditional_synced_token = Some(tok.clone());
+                    if cfg.live_armed {
+                        if let Some(creds) = live_creds.clone() {
+                            tokio::spawn(async move {
+                                match live_executor::sync_conditional_allowance(&creds, &tok).await {
+                                    Ok(()) => tracing::info!(token_id = %tok, "🔄 cache CONDITIONAL rafraîchi à l'adoption — SELL armé"),
+                                    Err(e) => tracing::warn!(error = %e, token_id = %tok, "⚠️ refresh cache CONDITIONAL à l'adoption échoué (SELL pourrait être rejeté)"),
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            None => conditional_synced_token = None,
         }
 
         // ── Maker : cycle de vie SÛR d'un BUY GTC resting (anti-orpheline) ───────────────
@@ -363,7 +419,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         // « combien a réellement rempli ? ». Le résultat (cumulatif) revient par recon_rx et
         // `reconcile_buy_to_server` cale la taille suivie sur la vérité serveur (idempotent). Ainsi,
         // même si le WS rate TOUS les events, on sait qu'on est rentré → on gère/revend la position.
-        if maker_mode && cfg.live_armed {
+        if maker_mode && cfg.live_armed && !buy_poll_done {
             if let Some(track_id) = live_mgr.tracked_buy_order_id() {
                 if now_ms.saturating_sub(last_status_poll_ms) >= 1500 {
                     last_status_poll_ms = now_ms;
@@ -371,7 +427,11 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         let tx = recon_tx.clone();
                         tokio::spawn(async move {
                             match live_executor::get_order_status(&creds, &track_id).await {
-                                Ok(st) if st.size_matched > 0.0 => { let _ = tx.send((track_id, st.size_matched, st.price)); }
+                                Ok(st) if st.size_matched > 0.0 => {
+                                    // "MATCHED" = ordre entièrement rempli → plus rien à poller.
+                                    let terminal = st.status.eq_ignore_ascii_case("MATCHED");
+                                    let _ = tx.send((track_id, st.size_matched, st.price, terminal));
+                                }
                                 Ok(_) => {}
                                 Err(e) => tracing::warn!(order_id = %track_id, error = %e,
                                     "⚠️ poll statut ordre échoué — si ça se répète, l'endpoint /data/order est à corriger"),
@@ -386,12 +446,16 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             if let Some((buy_id, since_ms, cancel_since)) = live_mgr.pending_buy_info() {
                 match cancel_since {
                     None => {
-                        if now_ms.saturating_sub(since_ms) >= cfg.buy_timeout_ms {
+                        // Annulation si timeout ATTEINT, OU si on entre dans la zone de flatten forcé :
+                        // un GTC rempli sous FORCE_EXIT_REMAINING_S serait dumpé instantanément à perte.
+                        let near_window_close = remaining_s <= FORCE_EXIT_REMAINING_S;
+                        if now_ms.saturating_sub(since_ms) >= cfg.buy_timeout_ms || near_window_close {
                             if let Some(engine) = engine_tx.as_ref() {
                                 let (tx, _rx) = oneshot::channel();
                                 let _ = engine.try_send(OrderCmd::Cancel { order_id: buy_id.clone(), reply: tx });
                             }
-                            tracing::info!(order_id = %buy_id, "🗑 BUY GTC non rempli — annulation envoyée (fenêtre de grâce)");
+                            let cause = if near_window_close { "fin de fenêtre (flatten imminent)" } else { "non rempli (timeout)" };
+                            tracing::info!(order_id = %buy_id, cause, "🗑 BUY GTC annulé — fenêtre de grâce");
                             live_mgr.mark_buy_cancelling(now_ms);
                         }
                     }
@@ -455,7 +519,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         //      spread d'entrée). max_hold/fin de fenêtre = sortie forcée.
                         let reason = if bid >= pos.tp_price { Some("take_profit") }
                             else if held_ms >= cfg.min_hold_sl_ms && bid <= pos.sl_price { Some("stop_loss") }
-                            else if held_s >= kelly.max_hold_secs || remaining_s <= 30 { Some("max_hold") }
+                            // Distinct de max_hold : la fenêtre se ferme, flatten forcé (≠ "détenu trop
+                            // longtemps"). Évite l'étiquette trompeuse "max_hold" sur un fill instantané.
+                            else if remaining_s <= FORCE_EXIT_REMAINING_S { Some("window_close") }
+                            else if held_s >= kelly.max_hold_secs { Some("max_hold") }
                             else { None };
                         // Throttle : un SELL rejeté (ex. settlement on-chain pas fini) revient en
                         // erreur immédiate → sans garde on re-poste toutes les 50 ms (80 ordres en

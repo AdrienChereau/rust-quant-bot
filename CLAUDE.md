@@ -34,6 +34,40 @@ cargo test                             # 59 tests
 Bouton dashboard → `POST /start` | `/stop` → bascule un AtomicBool (`live_paused` ou `paper_paused`).
 Le process et les WebSockets restent chauds. `LIVE_ARMED=true` (env) reste requis pour l'envoi réel.
 
+## ⚠️ Pièges live maker — câblage Polymarket (NE PAS reproduire)
+
+Diagnostiqués en prod (paper gagnait, live « rentrait mais ne sortait pas »). Coûteux à re-trouver.
+
+1. **VENDRE exige de rafraîchir le cache allowance `CONDITIONAL`** (≠ `COLLATERAL`). La doc impose
+   d'approuver/rafraîchir DEUX assets : USDC (acheter) **et** les conditional tokens (vendre). Après
+   un BUY, le CLOB voit **0** token outcome → tout SELL rejeté `not enough balance`. On rafraîchit
+   `sync_conditional_allowance(token_id)` (asset_type=CONDITIONAL) **dès l'adoption** d'une position,
+   hors hot-loop (`roles/live.rs`). Sans ça : on détient mais on ne peut pas revendre.
+2. **Un `balance: 0` au SELL n'est PAS une preuve de position perdue** — souvent juste le cache
+   CONDITIONAL périmé, ou le BUY pas encore réglé (`MATCHED→MINED→CONFIRMED`). Ne JAMAIS abandonner
+   d'emblée : refresh + ré-essai, abandon seulement après settlement ET plusieurs échecs
+   (`on_sell_result` renvoie un `bool` « needs refresh »).
+3. **Le poll d'achat ne doit JAMAIS recaler `size` après une vente.** La position porte `bought`
+   (cumul achat, monotone) et `sold` ; `size = bought − sold`. `reconcile_buy_to_server` se cale sur
+   `bought`, sinon une vente partielle est « ressuscitée » au cumul d'achat (on re-détient le vendu).
+4. **Taille de vente tronquée à 2 décimales vers le bas** (`decimal_from_f64(.., floor=true)` dans
+   `poly1271.rs`) — jamais arrondie au-dessus, sinon `not enough balance`. Reliquat < dust = se règle
+   à l'expiration.
+5. **post-only = GTC/GTD UNIQUEMENT.** `postOnly=true` avec FAK/FOK → ordre rejeté. Entrée maker =
+   GTC (post-only possible pour garantir le rebate), sortie taker = FAK (jamais post-only). Gérer
+   les statuts `delayed`/`unmatched` et erreurs `ORDER_DELAYED`/`MARKET_NOT_READY` (marchés à délai).
+6. **Fees Polymarket** : maker = **0** ; taker **crypto = 7 bps**, `fee = shares × 0.07 × p × (1−p)`
+   (max ~1,75¢/share à p≈0,5, ~0,3¢ aux extrêmes). La **clôture taker (FAK)** paie cette fee → à
+   intégrer dans l'edge requis / le TP (sinon un TP de 4¢ à mi-prix est mangé par la fee).
+7. **`max_hold` vs fin de fenêtre** : un GTC qui remplit < 30 s avant le rollover déclenche la sortie
+   forcée `remaining_s <= 30` (loguée `max_hold`) → entrée+sortie à la même ms à perte. `opened_ms`
+   est bien l'heure du FILL (pas `created_at`) ; le vrai correctif = ne pas laisser un BUY resting
+   filler dans la zone de mort (l'annuler avant), pas toucher au timer.
+
+> Source de vérité des fills : poll serveur `GET /data/order` (achat) + réponse HTTP FAK (vente).
+> Le user-WS est un filet, jamais l'unique source (il rate des events). Symétriser la vente via
+> `GET /data/trades` reste un durcissement ouvert.
+
 ## Docs
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — topologie, hot-path, locks, isolation.
