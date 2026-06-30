@@ -206,12 +206,12 @@ function initChart() {
   const el = $("live-chart");
   if (!el) return; // pas la vue live
   _chart = LightweightCharts.createChart(el, {
+    autoSize: true, // suit la taille du conteneur (s'ajuste quand la section live devient visible)
     layout: { background: { color: "transparent" }, textColor: "#9aa3b2" },
     grid: { vertLines: { color: "rgba(255,255,255,.05)" }, horzLines: { color: "rgba(255,255,255,.05)" } },
     rightPriceScale: { borderColor: "rgba(255,255,255,.12)" },
     timeScale: { borderColor: "rgba(255,255,255,.12)", timeVisible: true, secondsVisible: true },
     crosshair: { mode: 0 },
-    height: el.clientHeight || 340,
   });
   _sPrice = _chart.addLineSeries({ color: "#4ea1ff", lineWidth: 2, priceLineVisible: false });
   _sEntry = _chart.addLineSeries({ color: "#cfcfcf", lineWidth: 1, lineStyle: 2, priceLineVisible: false, crosshairMarkerVisible: false });
