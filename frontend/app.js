@@ -129,6 +129,7 @@ async function refresh() {
           $("pos").innerHTML = `<span class="warn">${s.pos_side.toUpperCase()} ouverte</span>`;
           $("ets").textContent = `${fmt(s.pos_entry,2)} / ${fmt(s.pos_tp,2)} / ${fmt(s.pos_sl,2)}`;
         } else { $("pos").textContent = "à plat"; $("ets").textContent = "—"; }
+        updatePositionLines(s); // lignes TP(vert)/SL(rouge)/ENTRÉE de la position en cours sur le chart
         $("cash").textContent = fmt(s.cash, 2);
         $("equity").textContent = fmt(s.equity, 2);
         $("dd").textContent = fmt(s.drawdown, 2);
@@ -242,3 +243,32 @@ async function refreshChart() {
 }
 setInterval(refreshChart, 1000);
 refreshChart();
+
+// ── Lignes de prix Entry/TP/SL de la position EN COURS (bold + labels sur l'axe de prix) ──────
+// TP toujours VERT, SL toujours ROUGE, ENTRÉE neutre — quel que soit le sens (up/down), car la
+// courbe est dans l'espace du token de la position (tp > entrée > sl par construction).
+let _plEntry = null, _plTp = null, _plSl = null;
+function _clearPosLines() {
+  for (const pl of [_plEntry, _plTp, _plSl]) if (pl && _sPrice) _sPrice.removePriceLine(pl);
+  _plEntry = _plTp = _plSl = null;
+}
+function updatePositionLines(s) {
+  const sub = document.getElementById("chart-sub");
+  if (!_chart || !_sPrice) return;
+  if (!s || !s.in_position) {
+    _clearPosLines();
+    if (sub) { sub.textContent = "à plat (aucune position)"; sub.style.color = ""; }
+    return;
+  }
+  const ensure = (pl, price, color, title) =>
+    pl ? (pl.applyOptions({ price, color, title }), pl)
+       : _sPrice.createPriceLine({ price, color, lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title });
+  _plTp    = ensure(_plTp,    s.pos_tp,    "#3ad29f", "TP");
+  _plEntry = ensure(_plEntry, s.pos_entry, "#dfe4ea", "ENTRÉE");
+  _plSl    = ensure(_plSl,    s.pos_sl,    "#ff5d5d", "SL");
+  if (sub) {
+    const side = (s.pos_side || "").toUpperCase();
+    sub.textContent = `${side} @ ${fmt(s.pos_entry, 3)}  ·  TP ${fmt(s.pos_tp, 2)}  ·  SL ${fmt(s.pos_sl, 2)}`;
+    sub.style.color = "#ffcf5d";
+  }
+}
