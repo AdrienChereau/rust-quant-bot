@@ -78,8 +78,11 @@ pub struct Config {
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
     pub maker_mode: bool,          // MAKER_MODE (paper) : simule une entrée maker (fill au bid) au lieu
                                    // de taker (VWAP des asks) → capte le spread. Optimiste (fill garanti).
-    pub exit_buffer: f64,          // EXIT_BUFFER : marge sous le bid pour les sorties (garantit le
-                                   // fill de la vente ; la FAK price-improve).
+    pub exit_buffer: f64,          // EXIT_BUFFER : prix de REPLI pour les sorties sur les chemins NON
+                                   // sig_type=3 (EIP-712). En live (POLY_1271) la vente est un VRAI
+                                   // ordre de marché (le SDK lit le book serveur) → ce prix est ignoré.
+    pub exit_retry_ms: u64,        // EXIT_RETRY_MS : throttle des re-tentatives de SELL. Plus court =
+                                   // re-quote plus vite au bid courant sur carnet mince (anti dérive TP→SL).
     pub entry_buffer: f64,         // ENTRY_BUFFER : marge AU-DESSUS de l'ask pour l'achat (garantit
                                    // le fill du BUY malgré le mouvement du prix pendant le round-trip).
     pub min_hold_sl_ms: u64,       // MIN_HOLD_SL_MS : délai avant que le SL puisse se déclencher
@@ -147,6 +150,7 @@ impl Config {
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
             maker_mode: env_or("MAKER_MODE", false),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
+            exit_retry_ms: env_or("EXIT_RETRY_MS", 150u64),
             entry_buffer: env_or("ENTRY_BUFFER", 0.02),
             min_hold_sl_ms: env_or("MIN_HOLD_SL_MS", 500u64),
 

@@ -6,16 +6,22 @@ use std::str::FromStr as _;
 
 use polymarket_client_sdk_v2::auth::{Credentials, LocalSigner, Normal, Signer};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::clob::types::{OrderSignature, OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{Amount, OrderSignature, OrderType, SignableOrder, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::{POLYGON};
 
 use super::live_executor::{LiveCredentials, OrderArgs, OrderKind, PlaceResult, CLOB_BASE};
 
-/// Décimales de la taille d'ordre = grille on-chain Polymarket (montants en base units 1e6).
-/// On tronque la taille à cette précision (jamais au-dessus) → revente exacte du fill, zéro poussière.
-const SIZE_DECIMALS: u32 = 6;
+/// Décimales MAX de la taille d'ordre acceptées par le CLOB Polymarket. C'est une **constante de
+/// protocole FIXE = 2 pour TOUS les marchés** (≠ le tick de PRIX qui, lui, est par-marché). Vérifié
+/// dans la source du SDK : `polymarket_client_sdk_v2/src/clob/order_builder.rs`
+/// → `pub(crate) const LOT_SIZE_SCALE: u32 = 2;` ; le builder rejette toute taille `scale() > 2`
+/// (« Unable to build Order: Size … has N decimal places. Maximum lot size is 2 »). On tronque vers
+/// le bas à 2 (jamais au-dessus → pas d'oversell). Le reliquat sous le lot (ex. fill 4,998687 →
+/// vente 4,99 ; reliquat 0,008687) est invendable et se règle à l'expiration — inhérent à la grille,
+/// PAS un bug à « corriger » avec plus de décimales (ça relançait la boucle de rejets en prod).
+const SIZE_DECIMALS: u32 = 2;
 
 // ─── Caches pré-chargés au démarrage (startup_poly) ────────────────────────────────────────────
 
@@ -130,26 +136,44 @@ pub async fn place_order_poly1271(
 ) -> anyhow::Result<PlaceResult> {
     let signer = local_signer(creds)?;
     let token = U256::from_str(token_id).map_err(|e| anyhow::anyhow!("token_id: {e}"))?;
+    // Taille TRONQUÉE vers le bas à 2 décimales (= LOT_SIZE_SCALE du CLOB). Floor (jamais au-dessus)
+    // → on ne vend jamais plus que détenu ("not enough balance") ET jamais > 2 décimales
+    // ("Maximum lot size is 2", qui bloquait la revente en boucle). cf. SIZE_DECIMALS.
+    let size = decimal_from_f64(args.size, SIZE_DECIMALS, true, "size")?;
 
-    // Métadonnées (price_dp + neg_risk) : cache si dispo (peuplé au rollover par preload_token_meta),
-    // sinon fallback réseau. Le fallback réutilise le client CACHÉ (pas de nouvelle auth = plus rapide).
-    // Clone AVANT tout `.await` : le MutexGuard std de TOKEN_META ne doit pas traverser un await (Send).
+    // ── SELL = ORDRE DE MARCHÉ ──────────────────────────────────────────────────────────────────
+    // On NE fixe AUCUN prix. `client.market_order()` va chercher le carnet SERVEUR EN DIRECT, calcule
+    // le prix de sweep (walk des bids) et envoie un FAK. Donc plus de "no orders found to match" dû à
+    // un bid LOCAL périmé : on vend au marché, peu importe le prix (comme à la main). Le FAK prend
+    // toute la liquidité dispo et kill le reste ; erreur seulement si le carnet est littéralement vide.
+    if args.is_sell {
+        return if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
+            let client = cache_lock.lock().await;
+            market_sell_with_client(&*client, &signer, token, size, live_armed).await
+        } else {
+            tracing::warn!("CACHED_AUTH_CLIENT absent — authenticate() per-ordre (lent)");
+            let client_tmp = authenticated_client(creds, &signer).await?;
+            market_sell_with_client(&client_tmp, &signer, token, size, live_armed).await
+        };
+    }
+
+    // ── BUY = LIMIT (maker GTC / taker FAK) ─────────────────────────────────────────────────────
+    // Seul le BUY a besoin du tick de PRIX (price_dp). neg_risk est résolu par le builder du SDK
+    // (l'ancien fetch neg_risk était inutilisé). Clone AVANT tout `.await` (MutexGuard std non-Send).
     let cached_meta = TOKEN_META.get().and_then(|c| c.lock().unwrap().get(token_id).cloned());
     let meta_t0 = std::time::Instant::now();
-    let (price_dp, neg_risk_val, from_cache) = match cached_meta {
-        Some(meta) => (meta.price_dp, meta.neg_risk, true),
+    let (price_dp, from_cache) = match cached_meta {
+        Some(meta) => (meta.price_dp, true),
         None => {
-            // Fallback réseau (neg_risk + tick_size). Réutilise CACHED_AUTH_CLIENT si présent.
-            let (neg, tick) = if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
+            let tick = if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
                 let client = cache_lock.lock().await;
-                tokio::join!(client.neg_risk(token), client.tick_size(token))
+                client.tick_size(token).await
             } else {
                 let client_tmp = authenticated_client(creds, &signer).await?;
-                tokio::join!(client_tmp.neg_risk(token), client_tmp.tick_size(token))
+                client_tmp.tick_size(token).await
             };
-            let neg = neg.map_err(|e| anyhow::anyhow!("{e}"))?;
             let tick = tick.map_err(|e| anyhow::anyhow!("{e}"))?;
-            (tick.minimum_tick_size.as_decimal().scale(), neg.neg_risk, false)
+            (tick.minimum_tick_size.as_decimal().scale(), false)
         }
     };
     let meta_ms = meta_t0.elapsed().as_millis() as u64;
@@ -158,23 +182,14 @@ pub async fn place_order_poly1271(
     }
 
     let price = decimal_from_f64(args.price, price_dp, false, "price")?;
-    // Taille : TRONQUÉE vers le bas (jamais arrondie au-dessus). Sinon une position de 4,995787
-    // détenue serait arrondie à 5,00 → POST rejeté "not enough balance" (on vendrait plus qu'on a).
-    // Précision = grille on-chain réelle (base units 1e6 → 6 décimales). Tronquer à 2 décimales
-    // laissait de la poussière non vendable : un fill de 2,09472 partait en 2,09 → reliquat
-    // 0,00472 jamais soldé. À 6 décimales on revend EXACTEMENT le fill (floor = jamais d'oversell).
-    let size = decimal_from_f64(args.size, SIZE_DECIMALS, true, "size")?;
-    let _ = neg_risk_val;
-    let side = if args.is_sell { Side::Sell } else { Side::Buy };
 
-    // Client caché (init au démarrage) ou temporaire si absent.
     if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
         let client = cache_lock.lock().await;
-        place_with_client(&*client, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms, kind).await
+        place_with_client(&*client, &signer, token, price, size, live_armed, meta_ms, kind).await
     } else {
         tracing::warn!("CACHED_AUTH_CLIENT absent — authenticate() per-ordre (lent)");
         let client_tmp = authenticated_client(creds, &signer).await?;
-        place_with_client(&client_tmp, &signer, token, side, price, size, live_armed, args.is_sell, meta_ms, kind).await
+        place_with_client(&client_tmp, &signer, token, price, size, live_armed, meta_ms, kind).await
     }
 }
 
@@ -206,25 +221,25 @@ pub async fn cancel_all_orders_poly1271(creds: &LiveCredentials) -> anyhow::Resu
     Ok(())
 }
 
+/// BUY limit (maker GTC / taker FAK) au prix fourni, puis signe + poste.
 #[allow(clippy::too_many_arguments)]
 async fn place_with_client<S: Signer>(
     client: &Client<Authenticated<Normal>>,
     signer: &S,
     token: U256,
-    side: Side,
     price: Decimal,
     size: Decimal,
     live_armed: bool,
-    is_sell: bool,
     meta_ms: u64,
     kind: OrderKind,
 ) -> anyhow::Result<PlaceResult> {
     let order_type = match kind { OrderKind::Fak => OrderType::FAK, OrderKind::Gtc => OrderType::GTC };
+    let label = match kind { OrderKind::Fak => "FAK", OrderKind::Gtc => "GTC" };
     let build_t0 = std::time::Instant::now();
     let signable = client
         .limit_order()
         .token_id(token)
-        .side(side)
+        .side(Side::Buy)
         .price(price)
         .size(size)
         .order_type(order_type)
@@ -232,7 +247,45 @@ async fn place_with_client<S: Signer>(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let build_ms = build_t0.elapsed().as_millis() as u64;
+    sign_and_post(client, signer, signable, false, meta_ms, build_ms, label, live_armed).await
+}
 
+/// SELL = ORDRE DE MARCHÉ. `client.market_order()` lit le carnet SERVEUR en direct, calcule le prix de
+/// sweep des bids et envoie un FAK (taille en shares). On ne fixe AUCUN prix → vente au marché.
+async fn market_sell_with_client<S: Signer>(
+    client: &Client<Authenticated<Normal>>,
+    signer: &S,
+    token: U256,
+    size: Decimal,
+    live_armed: bool,
+) -> anyhow::Result<PlaceResult> {
+    let amount = Amount::shares(size).map_err(|e| anyhow::anyhow!("market sell amount: {e}"))?;
+    let build_t0 = std::time::Instant::now();
+    let signable = client
+        .market_order()
+        .token_id(token)
+        .side(Side::Sell)
+        .amount(amount)
+        .order_type(OrderType::FAK)
+        .build()
+        .await
+        .map_err(|e| anyhow::anyhow!("market sell build (carnet vide ?): {e}"))?;
+    let build_ms = build_t0.elapsed().as_millis() as u64;
+    sign_and_post(client, signer, signable, true, 0, build_ms, "FAK-MARKET", live_armed).await
+}
+
+/// Signe (ERC-7739 Wrapped) puis poste l'ordre ; décode `making/taking` → (filled_size, avg_price).
+#[allow(clippy::too_many_arguments)]
+async fn sign_and_post<S: Signer>(
+    client: &Client<Authenticated<Normal>>,
+    signer: &S,
+    signable: SignableOrder,
+    is_sell: bool,
+    meta_ms: u64,
+    build_ms: u64,
+    order_type_label: &str,
+    live_armed: bool,
+) -> anyhow::Result<PlaceResult> {
     let sign_t0 = std::time::Instant::now();
     let signed = client.sign(signer, signable).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let sign_ms = sign_t0.elapsed().as_millis() as u64;
@@ -249,12 +302,8 @@ async fn place_with_client<S: Signer>(
         );
         anyhow::bail!("signature POLY_1271 invalide ({sig_len} car.) — rebuild avec SDK canary");
     }
-    tracing::warn!(
-        order_type = match kind { OrderKind::Fak => "FAK", OrderKind::Gtc => "GTC" },
-        signature_type = 3,
-        signature_len = sig_len,
-        "LIVE order POLY_1271 signé"
-    );
+    tracing::warn!(order_type = order_type_label, signature_type = 3, signature_len = sig_len,
+        "LIVE order POLY_1271 signé");
 
     if !live_armed {
         return Ok(PlaceResult::DryRun);
@@ -332,19 +381,22 @@ mod tests {
     use std::str::FromStr as _;
 
     #[test]
-    fn size_floor_keeps_six_decimals_no_dust() {
-        // Bug dust : un fill réel de 2,09472 doit être revendu EXACTEMENT (avant le fix, tronqué à 2
-        // décimales = 2,09 → reliquat 0,00472 invendable bloquant la position).
-        let d = decimal_from_f64(2.09472, SIZE_DECIMALS, true, "size").unwrap();
-        assert_eq!(d.to_string(), "2.09472");
+    fn size_floored_to_two_decimals_clob_lot_scale() {
+        // RÉGRESSION PROD : un fill maker fractionnaire (4,998687) DOIT être tronqué à 2 décimales
+        // (= LOT_SIZE_SCALE du CLOB), sinon "Maximum lot size is 2" → revente rejetée en boucle.
+        let d = decimal_from_f64(4.998687, SIZE_DECIMALS, true, "size").unwrap();
+        assert_eq!(d.to_string(), "4.99");
+        assert!(d.scale() <= 2, "≤ 2 décimales, sinon le CLOB rejette");
+        // 2,09472 → 2,09 (le reliquat 0,00472 est sous-lot, réglé à l'expiration).
+        assert_eq!(decimal_from_f64(2.09472, SIZE_DECIMALS, true, "size").unwrap().to_string(), "2.09");
     }
 
     #[test]
     fn size_floor_never_oversells() {
         // Troncature stricte vers le bas → jamais au-dessus du détenu (anti "not enough balance").
-        let d = decimal_from_f64(4.9999999, SIZE_DECIMALS, true, "size").unwrap();
-        assert_eq!(d, Decimal::from_str("4.999999").unwrap());
-        assert!(d <= Decimal::from_f64_retain(4.9999999).unwrap());
+        let d = decimal_from_f64(4.999999, SIZE_DECIMALS, true, "size").unwrap();
+        assert_eq!(d, Decimal::from_str("4.99").unwrap());
+        assert!(d <= Decimal::from_f64_retain(4.999999).unwrap());
     }
 
     #[test]

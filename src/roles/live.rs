@@ -546,15 +546,17 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             else if held_s >= kelly.max_hold_secs { Some("max_hold") }
                             else { None };
                         // Throttle : un SELL rejeté (ex. settlement on-chain pas fini) revient en
-                        // erreur immédiate → sans garde on re-poste toutes les 50 ms (80 ordres en
-                        // 5 s vus en prod). On limite les re-tentatives à ~1/400 ms.
+                        // erreur immédiate → sans garde on re-poste toutes les 50 ms. On limite à
+                        // exit_retry_ms (défaut 150 ms) : assez court pour rattraper le bid courant
+                        // sur carnet mince (anti dérive TP→SL), assez long pour ne pas spammer.
                         if let Some(r) = reason {
-                            if now_ms.saturating_sub(last_sell_attempt_ms) >= 400 {
+                            if now_ms.saturating_sub(last_sell_attempt_ms) >= cfg.exit_retry_ms {
                                 last_sell_attempt_ms = now_ms;
-                                // Toutes les sorties (TP/SL/max_hold) : vendre SOUS le bid pour garantir
-                                // le fill (la FAK price-improve jusqu'aux meilleurs bids ; le buffer absorbe
-                                // le mouvement du bid pendant le round-trip). Pour un TP, bid ≥ tp donc on
-                                // encaisse quand même le profit ; vendre au prix SL exact ne matchait jamais.
+                                // VENTE AU MARCHÉ : le TP/SL n'est qu'un DÉCLENCHEUR (faut-il sortir ?),
+                                // pas un prix. En live (POLY_1271) `place_order` envoie un VRAI ordre de
+                                // marché (le SDK lit le book SERVEUR en direct, sweep des bids, FAK) →
+                                // `exit` ci-dessous est IGNORÉ pour la vente. On le calcule seulement
+                                // comme prix de repli pour les chemins non sig_type=3 (EIP-712).
                                 let exit = (bid - cfg.exit_buffer).max(0.01);
                                 let (tx, rx_r) = oneshot::channel();
                                 let cmd = OrderCmd::Close {

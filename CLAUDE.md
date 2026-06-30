@@ -50,9 +50,14 @@ Diagnostiqués en prod (paper gagnait, live « rentrait mais ne sortait pas »).
 3. **Le poll d'achat ne doit JAMAIS recaler `size` après une vente.** La position porte `bought`
    (cumul achat, monotone) et `sold` ; `size = bought − sold`. `reconcile_buy_to_server` se cale sur
    `bought`, sinon une vente partielle est « ressuscitée » au cumul d'achat (on re-détient le vendu).
-4. **Taille de vente tronquée à 2 décimales vers le bas** (`decimal_from_f64(.., floor=true)` dans
-   `poly1271.rs`) — jamais arrondie au-dessus, sinon `not enough balance`. Reliquat < dust = se règle
-   à l'expiration.
+4. **Taille d'ordre = MAX 2 décimales, point.** C'est une **constante de protocole FIXE** :
+   `polymarket_client_sdk_v2 … order_builder.rs → const LOT_SIZE_SCALE: u32 = 2` ; le builder rejette
+   toute taille `scale() > 2` (« Maximum lot size is 2 ») pour TOUS les marchés (le tick de PRIX, lui,
+   est par-marché). ⚠️ **Ne JAMAIS « corriger le dust » en augmentant `SIZE_DECIMALS`** (un essai à 6
+   a bloqué toute revente en boucle infinie → SL forcé, juin 2026). Tronquer vers le bas à 2
+   (`decimal_from_f64(.., 2, floor=true)`), jamais au-dessus (sinon `not enough balance`). Le sous-lot
+   (ex. fill 4,998687 → vente 4,99) est invendable → réglé à l'expiration ; la FSM ferme la position
+   dès que le reliquat est sous le min d'échange.
 5. **post-only = GTC/GTD UNIQUEMENT.** `postOnly=true` avec FAK/FOK → ordre rejeté. Entrée maker =
    GTC (post-only possible pour garantir le rebate), sortie taker = FAK (jamais post-only). Gérer
    les statuts `delayed`/`unmatched` et erreurs `ORDER_DELAYED`/`MARKET_NOT_READY` (marchés à délai).
@@ -63,6 +68,14 @@ Diagnostiqués en prod (paper gagnait, live « rentrait mais ne sortait pas »).
    forcée `remaining_s <= 30` (loguée `max_hold`) → entrée+sortie à la même ms à perte. `opened_ms`
    est bien l'heure du FILL (pas `created_at`) ; le vrai correctif = ne pas laisser un BUY resting
    filler dans la zone de mort (l'annuler avant), pas toucher au timer.
+
+8. **Sortie = VRAI ordre de marché, jamais une limite dérivée du bid LOCAL.** Le book WebSocket local
+   est périmé (WS + POST jusqu'à ~2 s) : poser un SELL FAK à `bid_local − marge` devient non-marketable
+   dès que le vrai bid bouge plus que la marge → `no orders found to match with FAK order` → la position
+   dérive du TP jusqu'au SL. Fix : la vente passe par `client.market_order()` du SDK (`poly1271.rs` →
+   `market_sell_with_client`) — il va lire le carnet **serveur en direct**, calcule le prix de sweep et
+   envoie un FAK **sans prix imposé**. Mécanisme voulu : `Buy > Fill > Hit TP (déclencheur) > vente forcée
+   au marché`. Le TP/SL ne sert qu'à DÉCIDER de sortir, jamais comme prix.
 
 > Source de vérité des fills : poll serveur `GET /data/order` (achat) + réponse HTTP FAK (vente).
 > Le user-WS est un filet, jamais l'unique source (il rate des events). Symétriser la vente via
