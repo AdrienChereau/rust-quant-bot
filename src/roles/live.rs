@@ -268,6 +268,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                                 m.min_order_size,
                                             )
                                         };
+                                        // Plancher NOTIONNEL : un BUY market sous 1$ est rejeté
+                                        // (« invalid amount, min size: 1 »). On vise notional_target_usd
+                                        // (>1$) car le fill réel est un peu SOUS l'estimation order_price
+                                        // (best_ask+buffer) → la marge évite de retomber sous 1$.
+                                        let sized = sized.map(|s|
+                                            s.max((cfg.notional_target_usd / order_price).ceil()).max(m.min_order_size));
                                         match sized {
                                             None => tracing::info!(min = m.min_order_size, "✗ taille sous le minimum"),
                                             Some(size) if size * order_price > bk => tracing::warn!(

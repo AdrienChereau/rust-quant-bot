@@ -92,6 +92,9 @@ pub struct Config {
                                    // le fill du BUY malgré le mouvement du prix pendant le round-trip).
     pub min_hold_sl_ms: u64,       // MIN_HOLD_SL_MS : délai avant que le SL puisse se déclencher
                                    // (évite le SL instantané sur le spread d'entrée). TP non concerné.
+    pub notional_target_usd: f64,  // NOTIONAL_TARGET_USD : notionnel VISÉ par BUY (> 1$). On dimensionne
+                                   // le nb de shares pour viser ce montant ; la marge au-dessus de 1$
+                                   // absorbe l'écart estimation/fill réel (sinon BUY rejeté « min size: 1 »).
 
     // Infrastructure live (Bloc D)
     pub pm_ws_stale_threshold_ms: u64, // skip REST book si WS < ce seuil (ms)
@@ -159,6 +162,7 @@ impl Config {
             sell_skip_balance_refresh: env_or("SELL_SKIP_BALANCE_REFRESH", false),
             entry_buffer: env_or("ENTRY_BUFFER", 0.02),
             min_hold_sl_ms: env_or("MIN_HOLD_SL_MS", 500u64),
+            notional_target_usd: env_or("NOTIONAL_TARGET_USD", 1.20),
 
             pm_ws_stale_threshold_ms: env_or("PM_WS_STALE_THRESHOLD_MS", 2000u64),
             bankroll_poll_secs: env_or("BANKROLL_POLL_SECS", 10u64),
