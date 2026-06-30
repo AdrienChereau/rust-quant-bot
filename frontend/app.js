@@ -198,3 +198,47 @@ async function refresh() {
 setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
 setInterval(refresh, 1000);
 refresh();
+
+// ── Chart prix du token + niveaux Entry/TP/SL (TradingView Lightweight Charts) ──────────────
+let _chart = null, _sPrice, _sEntry, _sTp, _sSl;
+function initChart() {
+  if (_chart || !window.LightweightCharts) return;
+  const el = $("live-chart");
+  if (!el) return; // pas la vue live
+  _chart = LightweightCharts.createChart(el, {
+    layout: { background: { color: "transparent" }, textColor: "#9aa3b2" },
+    grid: { vertLines: { color: "rgba(255,255,255,.05)" }, horzLines: { color: "rgba(255,255,255,.05)" } },
+    rightPriceScale: { borderColor: "rgba(255,255,255,.12)" },
+    timeScale: { borderColor: "rgba(255,255,255,.12)", timeVisible: true, secondsVisible: true },
+    crosshair: { mode: 0 },
+    height: el.clientHeight || 340,
+  });
+  _sPrice = _chart.addLineSeries({ color: "#4ea1ff", lineWidth: 2, priceLineVisible: false });
+  _sEntry = _chart.addLineSeries({ color: "#cfcfcf", lineWidth: 1, lineStyle: 2, priceLineVisible: false, crosshairMarkerVisible: false });
+  _sTp    = _chart.addLineSeries({ color: "#3ad29f", lineWidth: 1, lineStyle: 2, priceLineVisible: false, crosshairMarkerVisible: false });
+  _sSl    = _chart.addLineSeries({ color: "#ff5d5d", lineWidth: 1, lineStyle: 2, priceLineVisible: false, crosshairMarkerVisible: false });
+  window.addEventListener("resize", () => { if (_chart && el) _chart.applyOptions({ width: el.clientWidth }); });
+}
+async function refreshChart() {
+  initChart();
+  if (!_chart) return;
+  try {
+    const h = await (await fetch("/history", { cache: "no-store" })).json();
+    if (!Array.isArray(h)) return;
+    // LWC exige des temps STRICTEMENT croissants & uniques → dédupe par seconde (garde le dernier).
+    const byT = new Map();
+    for (const pt of h) byT.set(pt.t, pt);
+    const pts = [...byT.values()].sort((a, b) => a.t - b.t);
+    const price = [], entry = [], tp = [], sl = [];
+    for (const pt of pts) {
+      price.push({ time: pt.t, value: pt.p });
+      // Whitespace ({time} sans value) quand pas en position → coupe la ligne entre 2 positions.
+      entry.push(pt.entry != null ? { time: pt.t, value: pt.entry } : { time: pt.t });
+      tp.push(pt.tp != null ? { time: pt.t, value: pt.tp } : { time: pt.t });
+      sl.push(pt.sl != null ? { time: pt.t, value: pt.sl } : { time: pt.t });
+    }
+    _sPrice.setData(price); _sEntry.setData(entry); _sTp.setData(tp); _sSl.setData(sl);
+  } catch (e) { /* backend injoignable : on garde l'ancienne courbe */ }
+}
+setInterval(refreshChart, 1000);
+refreshChart();

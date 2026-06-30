@@ -55,7 +55,13 @@
         <div id="pnl-label" class="pnl-label">REALIZED PNL — PAPER (USDC)</div>
         <div id="giant-pnl" class="giant-pnl">—</div>
     </div>
-    
+
+    <div class="card chart-card">
+      <h2>📈 Prix du token & niveaux — <span class="muted" id="chart-sub">Entry / TP / SL persistants</span></h2>
+      <div id="live-chart"></div>
+      <p class="muted" style="margin:.4rem 0 0">Courbe = <b>mark du token de la position</b> (Up = real_up, Down = 1−real_up ; real_up quand on est à plat). Lignes pointillées : <span style="color:#cfcfcf">entrée</span> · <span style="color:#3ad29f">TP</span> · <span style="color:#ff5d5d">SL</span>. Échantillon 1 s, ~1 h d'historique. (Le nœud live n'a pas le prix BTC — il faudrait le piper depuis le radar.)</p>
+    </div>
+
     <div class="grid">
         <div class="card control-panel">
           <h2>🎛️ Contrôle d'exécution</h2>
@@ -114,6 +120,7 @@
   </section>
 
   <footer class="muted">Connexion : <span id="status">…</span></footer>
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

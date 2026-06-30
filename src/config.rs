@@ -83,6 +83,11 @@ pub struct Config {
                                    // ordre de marché (le SDK lit le book serveur) → ce prix est ignoré.
     pub exit_retry_ms: u64,        // EXIT_RETRY_MS : throttle des re-tentatives de SELL. Plus court =
                                    // re-quote plus vite au bid courant sur carnet mince (anti dérive TP→SL).
+    pub sell_skip_balance_refresh: bool, // SELL_SKIP_BALANCE_REFRESH (EXPÉRIMENTAL, défaut false) : sur
+                                   // un SELL rejeté « balance 0 », NE PAS rafraîchir le cache CONDITIONAL
+                                   // → re-tire la vente brute (teste l'hypothèse « le moteur off-chain
+                                   // crédite au MATCHED »). ⚠ Si le cache n'est mis à jour QUE par le
+                                   // refresh, la vente peut rester bloquée jusqu'au rollover. Opt-in.
     pub entry_buffer: f64,         // ENTRY_BUFFER : marge AU-DESSUS de l'ask pour l'achat (garantit
                                    // le fill du BUY malgré le mouvement du prix pendant le round-trip).
     pub min_hold_sl_ms: u64,       // MIN_HOLD_SL_MS : délai avant que le SL puisse se déclencher
@@ -151,6 +156,7 @@ impl Config {
             maker_mode: env_or("MAKER_MODE", false),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
             exit_retry_ms: env_or("EXIT_RETRY_MS", 150u64),
+            sell_skip_balance_refresh: env_or("SELL_SKIP_BALANCE_REFRESH", false),
             entry_buffer: env_or("ENTRY_BUFFER", 0.02),
             min_hold_sl_ms: env_or("MIN_HOLD_SL_MS", 500u64),
 

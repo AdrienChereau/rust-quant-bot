@@ -110,9 +110,11 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         .unwrap_or((None, None));
 
     let dash = dashboard::shared(cfg.dry_run, "live");
+    // Historique de prix pour le chart du dashboard (courbe du token + lignes Entry/TP/SL).
+    let dash_hist = dashboard::history();
     {
-        let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
+        let (port, st, ct, hist) = (cfg.dashboard_port, dash.clone(), controls.clone(), dash_hist.clone());
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, Some(hist)).await; });
     }
 
     let pm = Arc::new(Mutex::new(PmShared::default()));
@@ -163,6 +165,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut last_sweep_ms: u64 = 0; // dernier balayage anti-orpheline (maker + Idle)
     let mut last_status_poll_ms: u64 = 0; // dernier poll de statut d'ordre (PendingBuy)
     let mut last_sell_attempt_ms: u64 = 0; // throttle des re-tentatives de SELL (anti-spam 50 ms)
+    let mut last_hist_ms: u64 = 0;         // dernier point poussé dans l'historique du chart (~1/s)
     // Token dont le cache d'allowance CONDITIONAL a déjà été rafraîchi pour la position courante.
     // Sans ce refresh, le CLOB voit 0 token outcome après le BUY → tout SELL est rejeté « balance 0 »
     // (on rentre mais on ne sort pas). On le fait UNE fois par position, dès l'adoption (hors hot-loop).
@@ -231,12 +234,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                     (None, _) => tracing::warn!("bankroll pas encore lue — tir ignoré"),
                                     (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
                                     (Some(bk), Some(engine)) => {
-                                        // MAKER : GTC posé DANS le spread (~mid, k·spread sous le mid),
-                                        // borné sous l'ask → reste maker, mais près du touch pour un VRAI
-                                        // taux de fill (plus de bid fantôme à 0.26 quand le marché est à
-                                        // 0.65). Carnet incomplet (pas de bid/ask) → on s'abstient : un
-                                        // maker ne remplira pas, et un prix de repli serait incohérent.
-                                        // TAKER : FAK à ask + marge (garantit le match malgré le mouvement).
+                                        // TAKER (défaut, EXEC_MODE=taker) : kind=Fak → `place_order` envoie
+                                        // un VRAI ordre de marché (le SDK lit le carnet serveur, sweep des
+                                        // asks). `order_price` ci-dessous n'est qu'une ESTIMATION (best_ask)
+                                        // pour le sizing/bankroll — il est IGNORÉ par le market buy. Symétrie
+                                        // entrée/sortie : achat ET vente au marché.
+                                        // MAKER (EXEC_MODE=maker, legacy) : GTC dans le spread, prix réel.
                                         let price_kind = if maker_mode {
                                             match (book.best_bid(), book.best_ask()) {
                                                 (Some(bid), Some(ask)) => Some((
@@ -330,6 +333,22 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 if let Some(ref tx) = user_ws_cond_tx {
                     let _ = tx.send(Some(m.condition_id.clone()));
                 }
+                // Pré-chauffe l'allowance CONDITIONAL des 2 tokens du nouveau marché (hors hot-path).
+                // Ainsi, à la 1re vente d'une position, le cache d'allowance est déjà chaud → on
+                // n'attend QUE le settlement du solde, pas l'approbation. (Le solde lui-même est
+                // rafraîchi à l'adoption / sur rejet — il dépend du settlement on-chain.)
+                if cfg.live_armed {
+                    if let Some(creds) = live_creds.clone() {
+                        let (up_tok, down_tok) = (m.up_token_id.clone(), m.down_token_id.clone());
+                        tokio::spawn(async move {
+                            for tok in [up_tok, down_tok] {
+                                if let Err(e) = live_executor::sync_conditional_allowance(&creds, &tok).await {
+                                    tracing::warn!(error = %e, token_id = %tok, "⚠️ pré-chauffe allowance CONDITIONAL (rollover) échouée");
+                                }
+                            }
+                        });
+                    }
+                }
             }
         }
 
@@ -380,6 +399,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 Err(_) => false,
             }
         });
+        // Taker (entrée au marché) : un BUY FAK market remplit ou échoue tout de suite. S'il revient
+        // sans fill (carnet vide → fill 0), il créerait un PendingBuy que SEUL le cycle de vie maker
+        // nettoie → orphelin en taker. On repasse Idle immédiatement (rien ne dort dans le carnet).
+        if !maker_mode && live_mgr.pending_buy_info().is_some() {
+            live_mgr.cancel_pending_buy();
+        }
         if let Some((r, reason)) = pending_close.as_mut() {
             match r.try_recv() {
                 Ok(res) => {
@@ -387,7 +412,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                     let needs_cond_refresh = live_mgr.on_sell_result(res, reason, now_ms, min_os);
                     // SELL rejeté « balance 0 » → cache CONDITIONAL probablement périmé : on le
                     // rafraîchit (hors hot-loop) pour débloquer la prochaine tentative de revente.
-                    if needs_cond_refresh && cfg.live_armed {
+                    // SELL_SKIP_BALANCE_REFRESH (expérimental) : on SAUTE le refresh → la re-tentative
+                    // re-tire la vente brute (teste si le moteur off-chain l'accepte au MATCHED).
+                    if needs_cond_refresh && cfg.live_armed && !cfg.sell_skip_balance_refresh {
                         if let (Some(creds), Some(tok)) =
                             (live_creds.clone(), live_mgr.position().map(|p| p.token_id.clone()))
                         {
@@ -412,6 +439,9 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             Some(tok) => {
                 if conditional_synced_token.as_deref() != Some(tok.as_str()) {
                     conditional_synced_token = Some(tok.clone());
+                    // Nouvelle position → reset du throttle de sortie : le 1er exit (TP surtout) doit
+                    // pouvoir partir SANS délai (le throttle exit_retry_ms ne concerne que les re-essais).
+                    last_sell_attempt_ms = 0;
                     if cfg.live_armed {
                         if let Some(creds) = live_creds.clone() {
                             tokio::spawn(async move {
@@ -628,6 +658,21 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                 (Some(t), Some(d2), Some(p)) => Some(t + d2 + p),
                 _ => None,
             };
+        }
+
+        // ── Historique de prix pour le chart (~1/s) ───────────────────────────────────
+        // `p` = mark du TOKEN DE LA POSITION (Up = real_up, Down = 1−real_up) pendant une position,
+        // sinon real_up. Les niveaux entry/tp/sl sont dans le même espace → lignes alignées.
+        if now_ms.saturating_sub(last_hist_ms) >= 1000 {
+            last_hist_ms = now_ms;
+            let (p, entry, tp, sl) = match live_mgr.position() {
+                Some(pos) => {
+                    let mark = if pos.side == Side::Up { real_up } else { 1.0 - real_up };
+                    (mark, Some(pos.entry_price), Some(pos.tp_price), Some(pos.sl_price))
+                }
+                None => (real_up, None, None, None),
+            };
+            dashboard::push_history(&dash_hist, dashboard::PricePoint { t: now_ms / 1000, p, entry, tp, sl });
         }
 
         log_throttle += 1;

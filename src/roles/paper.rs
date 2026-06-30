@@ -28,7 +28,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let dash = dashboard::shared(true, "paper");
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, None).await; });
     }
 
     // Flux marché Polymarket (carnets pour fills VWAP + marks) — public, sans credential.

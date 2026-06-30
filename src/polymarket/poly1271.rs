@@ -141,24 +141,32 @@ pub async fn place_order_poly1271(
     // ("Maximum lot size is 2", qui bloquait la revente en boucle). cf. SIZE_DECIMALS.
     let size = decimal_from_f64(args.size, SIZE_DECIMALS, true, "size")?;
 
-    // ── SELL = ORDRE DE MARCHÉ ──────────────────────────────────────────────────────────────────
-    // On NE fixe AUCUN prix. `client.market_order()` va chercher le carnet SERVEUR EN DIRECT, calcule
-    // le prix de sweep (walk des bids) et envoie un FAK. Donc plus de "no orders found to match" dû à
-    // un bid LOCAL périmé : on vend au marché, peu importe le prix (comme à la main). Le FAK prend
-    // toute la liquidité dispo et kill le reste ; erreur seulement si le carnet est littéralement vide.
-    if args.is_sell {
+    // ── ORDRE DE MARCHÉ (taker) : SELL (sortie) ET BUY taker (entrée, kind=Fak) ──────────────────
+    // On NE fixe AUCUN prix : `client.market_order()` lit le carnet SERVEUR EN DIRECT, calcule le prix
+    // de sweep (asks pour un BUY, bids pour un SELL) et envoie un FAK. Plus de "no orders found to
+    // match" dû à un carnet LOCAL périmé. Le FAK prend la liquidité dispo et kill le reste ; erreur
+    // seulement si le carnet est vide. Symétrie entrée/sortie = même chemin taker. (BUY kind=Gtc =
+    // chemin maker limit ci-dessous, conservé pour paper/mono/legacy.)
+    let market_side = if args.is_sell {
+        Some(Side::Sell)
+    } else if matches!(kind, OrderKind::Fak) {
+        Some(Side::Buy) // entrée TAKER au marché
+    } else {
+        None // BUY GTC = maker limit
+    };
+    if let Some(side) = market_side {
         return if let Some(cache_lock) = CACHED_AUTH_CLIENT.get() {
             let client = cache_lock.lock().await;
-            market_sell_with_client(&*client, &signer, token, size, live_armed).await
+            market_order_with_client(&*client, &signer, token, side, size, live_armed).await
         } else {
             tracing::warn!("CACHED_AUTH_CLIENT absent — authenticate() per-ordre (lent)");
             let client_tmp = authenticated_client(creds, &signer).await?;
-            market_sell_with_client(&client_tmp, &signer, token, size, live_armed).await
+            market_order_with_client(&client_tmp, &signer, token, side, size, live_armed).await
         };
     }
 
-    // ── BUY = LIMIT (maker GTC / taker FAK) ─────────────────────────────────────────────────────
-    // Seul le BUY a besoin du tick de PRIX (price_dp). neg_risk est résolu par le builder du SDK
+    // ── BUY LIMIT GTC (maker — conservé pour paper/mono/legacy) ─────────────────────────────────
+    // Seul ce chemin a besoin du tick de PRIX (price_dp). neg_risk est résolu par le builder du SDK
     // (l'ancien fetch neg_risk était inutilisé). Clone AVANT tout `.await` (MutexGuard std non-Send).
     let cached_meta = TOKEN_META.get().and_then(|c| c.lock().unwrap().get(token_id).cloned());
     let meta_t0 = std::time::Instant::now();
@@ -250,28 +258,32 @@ async fn place_with_client<S: Signer>(
     sign_and_post(client, signer, signable, false, meta_ms, build_ms, label, live_armed).await
 }
 
-/// SELL = ORDRE DE MARCHÉ. `client.market_order()` lit le carnet SERVEUR en direct, calcule le prix de
-/// sweep des bids et envoie un FAK (taille en shares). On ne fixe AUCUN prix → vente au marché.
-async fn market_sell_with_client<S: Signer>(
+/// ORDRE DE MARCHÉ (taker) BUY ou SELL. `client.market_order()` lit le carnet SERVEUR en direct,
+/// calcule le prix de sweep (asks pour un BUY, bids pour un SELL) et envoie un FAK (taille en shares).
+/// On ne fixe AUCUN prix → exécution au marché. Symétrique entrée/sortie.
+async fn market_order_with_client<S: Signer>(
     client: &Client<Authenticated<Normal>>,
     signer: &S,
     token: U256,
+    side: Side,
     size: Decimal,
     live_armed: bool,
 ) -> anyhow::Result<PlaceResult> {
-    let amount = Amount::shares(size).map_err(|e| anyhow::anyhow!("market sell amount: {e}"))?;
+    let amount = Amount::shares(size).map_err(|e| anyhow::anyhow!("market amount: {e}"))?;
     let build_t0 = std::time::Instant::now();
     let signable = client
         .market_order()
         .token_id(token)
-        .side(Side::Sell)
+        .side(side)
         .amount(amount)
         .order_type(OrderType::FAK)
         .build()
         .await
-        .map_err(|e| anyhow::anyhow!("market sell build (carnet vide ?): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("market build (carnet vide ?): {e}"))?;
     let build_ms = build_t0.elapsed().as_millis() as u64;
-    sign_and_post(client, signer, signable, true, 0, build_ms, "FAK-MARKET", live_armed).await
+    let is_sell = matches!(side, Side::Sell);
+    let label = if is_sell { "FAK-MKT-SELL" } else { "FAK-MKT-BUY" };
+    sign_and_post(client, signer, signable, is_sell, 0, build_ms, label, live_armed).await
 }
 
 /// Signe (ERC-7739 Wrapped) puis poste l'ordre ; décode `making/taking` → (filled_size, avg_price).

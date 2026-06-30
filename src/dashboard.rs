@@ -2,8 +2,9 @@
 //! Tourne sur une tâche séparée lisant un snapshot partagé → **zéro impact** sur
 //! le hot-loop (OBI 50 ms + FSM).
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,6 +12,36 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 use crate::state::RuntimeControls;
+
+/// Un point de la courbe du dashboard live. `p` = mark du token de la position (Up = real_up,
+/// Down = 1−real_up) pendant une position, sinon real_up. `entry/tp/sl` = niveaux de la position
+/// EN COURS (dans le même espace de prix que `p`) → lignes persistantes alignées sur la courbe.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PricePoint {
+    pub t: u64, // epoch secondes (unique/croissant pour le charting)
+    pub p: f64,
+    pub entry: Option<f64>,
+    pub tp: Option<f64>,
+    pub sl: Option<f64>,
+}
+
+/// Buffer circulaire d'historique de prix (sérialisé à `/history`). Mutex std : accès court, hors
+/// hot-loop. Le nœud live y pousse ~1 pt/s ; les autres nœuds n'en ont pas (`None`).
+pub type History = Arc<Mutex<VecDeque<PricePoint>>>;
+
+const HISTORY_CAP: usize = 3600; // ~1 h à 1 pt/s
+
+pub fn history() -> History {
+    Arc::new(Mutex::new(VecDeque::with_capacity(HISTORY_CAP)))
+}
+
+/// Ajoute un point (évince le plus vieux au-delà de la capacité). Appelé ~1/s par le nœud live.
+pub fn push_history(h: &History, pt: PricePoint) {
+    if let Ok(mut q) = h.lock() {
+        if q.len() >= HISTORY_CAP { q.pop_front(); }
+        q.push_back(pt);
+    }
+}
 
 const INDEX_HTML: &str = include_str!("../frontend/index.html");
 const STYLE_CSS: &str = include_str!("../frontend/style.css");
@@ -98,13 +129,14 @@ pub fn shared(dry_run: bool, node_kind: &str) -> Shared {
     Arc::new(RwLock::new(DashState { dry_run, node_kind: node_kind.to_string(), ..Default::default() }))
 }
 
-pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> anyhow::Result<()> {
+pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>, history: Option<History>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "Dashboard sur http://0.0.0.0:{port}");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else { continue };
         let state = state.clone();
         let controls = controls.clone();
+        let history = history.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let Ok(n) = sock.read(&mut buf).await else { return };
@@ -128,6 +160,12 @@ pub async fn serve(port: u16, state: Shared, controls: Arc<RuntimeControls>) -> 
                 "/style.css" => ("text/css; charset=utf-8", STYLE_CSS.to_string()),
                 "/app.js" => ("application/javascript; charset=utf-8", APP_JS.to_string()),
                 "/state" => ("application/json", serde_json::to_string(&*state.read().await).unwrap_or_else(|_| "{}".into())),
+                "/history" => ("application/json", match &history {
+                    Some(h) => h.lock().ok()
+                        .and_then(|q| serde_json::to_string(&*q).ok())
+                        .unwrap_or_else(|| "[]".into()),
+                    None => "[]".into(),
+                }),
                 _ => ("text/plain", "not found".to_string()),
             };
             let _ = sock.write_all(http_resp(ctype, &body).as_bytes()).await;

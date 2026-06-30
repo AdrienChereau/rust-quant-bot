@@ -148,7 +148,7 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     let dash = dashboard::shared(cfg.dry_run, "mono");
     {
         let (port, st, ct) = (cfg.dashboard_port, dash.clone(), controls.clone());
-        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct).await; });
+        tokio::spawn(async move { let _ = dashboard::serve(port, st, ct, None).await; });
     }
 
     // Sonde de latence TCP (toutes les 5 s, hors hot-loop) — mono = les trois cibles.
