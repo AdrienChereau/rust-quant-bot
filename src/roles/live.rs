@@ -197,7 +197,11 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         // plus on est tard dans la fenêtre (temps écoulé), plus l'edge exigé est grand.
                         let decisiveness = (real_up - 0.5).abs();
                         let time_factor = ((300.0 - remaining_s as f64) / 300.0).clamp(0.0, 1.0);
-                        let required_gap = cfg.gap_min + cfg.gap_dynamic_k * decisiveness * time_factor;
+                        // Sortie FAK = fee taker Polymarket (1 jambe ; entrée maker GTC = 0 fee). Maximale
+                        // à real≈0.5 → exige plus d'edge au mid (là où la fee mange le TP), permissif aux
+                        // extrêmes. fee/share = coeff·p·(1−p), p ≈ prix du token (real_up(1−real_up) symétrique).
+                        let fee_term = taker_exit_fee(cfg.taker_fee_coeff, real_up);
+                        let required_gap = cfg.gap_min + cfg.gap_dynamic_k * decisiveness * time_factor + fee_term;
                         let reject = if controls.is_breaker_tripped() { Some("breaker déclenché") }
                             else if !controls.live_active() { Some("live en pause") }
                             else if market.is_none() { Some("pas de marché") }
@@ -227,16 +231,28 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                     (None, _) => tracing::warn!("bankroll pas encore lue — tir ignoré"),
                                     (_, None) => tracing::warn!("OrderEngine absent — tir ignoré"),
                                     (Some(bk), Some(engine)) => {
-                                        // MAKER : on POSTE un GTC au bid (capte le spread) dans la bande
-                                        // rewards du mid → dort dans le carnet, pas de FAK no-match.
+                                        // MAKER : GTC posé DANS le spread (~mid, k·spread sous le mid),
+                                        // borné sous l'ask → reste maker, mais près du touch pour un VRAI
+                                        // taux de fill (plus de bid fantôme à 0.26 quand le marché est à
+                                        // 0.65). Carnet incomplet (pas de bid/ask) → on s'abstient : un
+                                        // maker ne remplira pas, et un prix de repli serait incohérent.
                                         // TAKER : FAK à ask + marge (garantit le match malgré le mouvement).
-                                        let (order_price, kind) = if maker_mode {
-                                            let bid = book.best_bid().unwrap_or(real_up);
-                                            let ask = book.best_ask().unwrap_or(real_up);
-                                            let mid = (bid + ask) / 2.0;
-                                            (bid.max(mid - cfg.reward_max_spread).clamp(0.01, 0.99), OrderKind::Gtc)
+                                        let price_kind = if maker_mode {
+                                            match (book.best_bid(), book.best_ask()) {
+                                                (Some(bid), Some(ask)) => Some((
+                                                    maker_buy_price(bid, ask, m.tick_size,
+                                                        cfg.maker_price_k_spread, cfg.maker_price_eps_ticks),
+                                                    OrderKind::Gtc,
+                                                )),
+                                                _ => None,
+                                            }
                                         } else {
-                                            ((book.best_ask().unwrap_or(real_up) + cfg.entry_buffer).min(0.99), OrderKind::Fak)
+                                            Some(((book.best_ask().unwrap_or(real_up) + cfg.entry_buffer).min(0.99), OrderKind::Fak))
+                                        };
+                                        let Some((order_price, kind)) = price_kind else {
+                                            tracing::info!(side = side.as_str(),
+                                                "✗ tir maker ignoré — carnet incomplet (pas de bid/ask fiable)");
+                                            continue;
                                         };
                                         let sized = if cfg.fixed_order_usd > 0.0 {
                                             // Notionnel fixe ($) — Kelly ignoré ; plancher = min d'échange.
@@ -449,7 +465,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         // Annulation si timeout ATTEINT, OU si on entre dans la zone de flatten forcé :
                         // un GTC rempli sous FORCE_EXIT_REMAINING_S serait dumpé instantanément à perte.
                         let near_window_close = remaining_s <= FORCE_EXIT_REMAINING_S;
-                        if now_ms.saturating_sub(since_ms) >= cfg.buy_timeout_ms || near_window_close {
+                        // Timeout adaptatif : frac du temps restant, borné [floor (≥ latence POST observée
+                        // ~1,3 s), buy_timeout_ms]. Tôt en fenêtre → grâce pleine ; proche de l'expiration →
+                        // grâce courte (mais jamais < floor, sinon on annule avant que l'ordre repose).
+                        let eff_timeout = ((remaining_s.max(0) as f64) * 1000.0 * cfg.grace_frac_of_remaining)
+                            .clamp(cfg.buy_grace_floor_ms as f64, cfg.buy_timeout_ms as f64) as u64;
+                        if now_ms.saturating_sub(since_ms) >= eff_timeout || near_window_close {
                             if let Some(engine) = engine_tx.as_ref() {
                                 let (tx, _rx) = oneshot::channel();
                                 let _ = engine.try_send(OrderCmd::Cancel { order_id: buy_id.clone(), reply: tx });
@@ -612,5 +633,71 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             tracing::info!(real = format!("{:.3}", real_up), live_shots = live_mgr.state.shots,
                 bankroll = format!("{:?}", live_bankroll_val), "live");
         }
+    }
+}
+
+/// Arrondit au tick le plus proche, clampé dans [0.01, 0.99] (identique à `order_engine`/`live_position`).
+fn round_tick(p: f64, tick: f64) -> f64 {
+    if tick <= 0.0 { return p; }
+    ((p / tick).round() * tick).clamp(0.01, 0.99)
+}
+
+/// Prix d'un BUY maker posé DANS le spread (`mid − k·spread`), borné sous l'ask (`eps` ticks) pour
+/// rester STRICTEMENT maker. `k=0.5` ⇒ best bid (ancien comportement), `0.25` ⇒ entre mid et bid
+/// (meilleur taux de fill), `0` ⇒ mid. Le plafond `ask − eps·tick` garantit qu'on ne croise jamais.
+fn maker_buy_price(bid: f64, ask: f64, tick: f64, k_spread: f64, eps_ticks: f64) -> f64 {
+    let spread = (ask - bid).max(0.0);
+    let mid = (bid + ask) / 2.0;
+    let ceiling = (ask - eps_ticks * tick).max(0.01); // garde-fou maker (sous l'ask)
+    let lo = bid.min(ceiling);
+    round_tick((mid - k_spread * spread).clamp(lo, ceiling), tick)
+}
+
+/// Fee de SORTIE taker (1 jambe FAK) en prix/share : `coeff·p·(1−p)`. Maximale à `p=0.5`, ~0 aux
+/// extrêmes (doc Polymarket : `fee = shares·coeff·p·(1−p)`, crypto `coeff=0.07`). L'entrée maker GTC
+/// ne paie rien → un seul terme.
+fn taker_exit_fee(coeff: f64, p: f64) -> f64 { coeff * p * (1.0 - p) }
+
+#[cfg(test)]
+mod tests {
+    use super::{maker_buy_price, round_tick, taker_exit_fee};
+
+    #[test]
+    fn maker_price_below_ask_above_bid_for_k_quarter() {
+        // Spread large : bid 0.40 / ask 0.50, tick 0.01, k=0.25, eps=1.
+        let p = maker_buy_price(0.40, 0.50, 0.01, 0.25, 1.0);
+        assert!(p < 0.50, "doit rester maker (< ask), got {p}");
+        assert!(p <= 0.49 + 1e-9, "plafonné à ask − 1 tick, got {p}");
+        assert!(p > 0.40, "au-dessus du best bid pour k<0.5 (meilleur fill), got {p}");
+        assert!((p - 0.425).abs() <= 0.01, "≈ mid − k·spread (0.425 au tick), got {p}");
+    }
+
+    #[test]
+    fn maker_price_k_half_equals_best_bid() {
+        // k=0.5 ⇒ mid − 0.5·spread = bid (ancien comportement préservé).
+        let p = maker_buy_price(0.40, 0.50, 0.01, 0.5, 1.0);
+        assert!((p - 0.40).abs() < 1e-9, "k=0.5 ⇒ best bid, got {p}");
+    }
+
+    #[test]
+    fn maker_price_one_tick_market_clamps_under_ask() {
+        // Spread 1 tick : bid 0.49 / ask 0.50 → le plafond (ask − 1 tick = 0.49) lie, jamais ≥ ask.
+        let p = maker_buy_price(0.49, 0.50, 0.01, 0.25, 1.0);
+        assert!((p - 0.49).abs() < 1e-9, "clamp au plafond 0.49, got {p}");
+        assert!(p < 0.50, "jamais ≥ ask");
+    }
+
+    #[test]
+    fn taker_exit_fee_max_at_mid_zero_at_extremes() {
+        let mid = taker_exit_fee(0.07, 0.50);
+        assert!((mid - 0.0175).abs() < 1e-9, "0.07·0.25 = 0.0175 au mid, got {mid}");
+        assert!(taker_exit_fee(0.07, 0.05) < mid / 4.0, "fee minuscule aux extrêmes");
+        assert!(taker_exit_fee(0.07, 0.95) < mid / 4.0, "symétrique : faible à 0.95 aussi");
+    }
+
+    #[test]
+    fn round_tick_rounds_and_clamps() {
+        assert!((round_tick(0.4267, 0.01) - 0.43).abs() < 1e-9);
+        assert_eq!(round_tick(0.004, 0.01), 0.01); // clamp bas
     }
 }

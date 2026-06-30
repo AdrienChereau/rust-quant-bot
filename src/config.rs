@@ -30,6 +30,10 @@ pub struct Config {
     pub gap_dynamic_k: f64,          // GAP_DYNAMIC_K : gap requis += k·|real_up−0.5|·(temps_écoulé/fenêtre)
                                      // → exige un edge d'autant plus grand que le binaire est décidé ET tardif.
     pub velocity_confirm: f64,       // |ΔP_1s| minimal (0 = désactivé)
+    pub taker_fee_coeff: f64,        // TAKER_FEE_COEFF : coeff de la fee taker Polymarket (crypto = 0.07).
+                                     // fee/share = coeff·p·(1−p). En stratégie entrée maker (GTC, 0 fee)
+                                     // / sortie FAK (taker), on ne la paie qu'à la SORTIE → le gap requis
+                                     // intègre 1·coeff·p·(1−p) (0 = désactivé).
 
     // Garde-fou binaire (anti deep-ITM/OTM)
     pub price_min: f64,              // PRICE_MIN : real_up min pour trader (sinon binaire trop décidé)
@@ -54,8 +58,14 @@ pub struct Config {
     // Live testing (passage paper → réel)
     pub exec_mode: String,     // EXEC_MODE : "taker" (FAK, chemin actuel) | "maker" (GTC resting).
                                // Défaut "taker" → le live actuel est préservé, le maker est opt-in.
-    pub reward_max_spread: f64, // REWARD_MAX_SPREAD : poster l'ordre maker à ≤ ce spread du mid (bande rewards).
-    pub buy_timeout_ms: u64,    // BUY_TIMEOUT_MS : si le BUY GTC ne fill pas après ce délai → annuler.
+    pub maker_price_k_spread: f64, // MAKER_PRICE_K_SPREAD : prix maker = mid − k·spread. 0.5 = best bid
+                                   // (ancien comportement), 0.25 = entre mid et bid (plus de fill), 0 = mid.
+    pub maker_price_eps_ticks: f64, // MAKER_PRICE_EPS_TICKS : plafonner le prix maker à ask − eps·tick
+                                    // (reste STRICTEMENT maker, jamais de cross accidentel).
+    pub grace_frac_of_remaining: f64, // GRACE_FRAC_OF_REMAINING : timeout BUY GTC = frac·temps_restant,
+                                      // borné [buy_grace_floor_ms, buy_timeout_ms].
+    pub buy_grace_floor_ms: u64,  // BUY_GRACE_FLOOR_MS : plancher du timeout adaptatif (≥ latence POST).
+    pub buy_timeout_ms: u64,    // BUY_TIMEOUT_MS : plafond du timeout BUY GTC (grâce pleine tôt en fenêtre).
     pub sell_timeout_ms: u64,   // SELL_TIMEOUT_MS : PendingSell sans confirmation WS après ce délai →
                                 // on REPASSE Open pour re-tenter la vente (anti-position-coincée).
     pub cancel_grace_ms: u64,   // CANCEL_GRACE_MS : après une annulation, fenêtre où un fill GAGNE encore
@@ -104,6 +114,7 @@ impl Config {
             gap_min: env_or("GAP_MIN", 0.02),
             gap_dynamic_k: env_or("GAP_DYNAMIC_K", 0.5),
             velocity_confirm: env_or("VELOCITY_CONFIRM", 0.0),
+            taker_fee_coeff: env_or("TAKER_FEE_COEFF", 0.07),
 
             price_min: env_or("PRICE_MIN", 0.02),
             price_max: env_or("PRICE_MAX", 0.98),
@@ -123,7 +134,10 @@ impl Config {
             max_hold_secs: env_or("MAX_HOLD_SECS", 60),
 
             exec_mode: env::var("EXEC_MODE").unwrap_or_else(|_| "taker".into()),
-            reward_max_spread: env_or("REWARD_MAX_SPREAD", 0.03),
+            maker_price_k_spread: env_or("MAKER_PRICE_K_SPREAD", 0.25),
+            maker_price_eps_ticks: env_or("MAKER_PRICE_EPS_TICKS", 1.0),
+            grace_frac_of_remaining: env_or("GRACE_FRAC_OF_REMAINING", 0.15),
+            buy_grace_floor_ms: env_or("BUY_GRACE_FLOOR_MS", 1500u64),
             buy_timeout_ms: env_or("BUY_TIMEOUT_MS", 8000u64),
             sell_timeout_ms: env_or("SELL_TIMEOUT_MS", 3000u64),
             cancel_grace_ms: env_or("CANCEL_GRACE_MS", 3000u64),
