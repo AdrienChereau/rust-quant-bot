@@ -167,6 +167,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut last_sell_attempt_ms: u64 = 0; // throttle des re-tentatives de SELL (anti-spam 50 ms)
     let mut last_hist_ms: u64 = 0;         // dernier point poussé dans l'historique du chart (~1/s)
     let mut pending_favorite = false;      // le prochain fill adopté est une entrée FAVORITE (→ hold_to_resolution)
+    let mut favorite_window_id = String::new(); // condition_id de la fenêtre où on a DÉJÀ tenté la favorite
+                                                 // (anti-boucle : 1 seule entrée favorite par fenêtre)
     let mut real_up_vol: f64 = 0.0;        // EWMA de |Δreal_up|/s : proxy de vol observé côté live (favorite)
     let mut last_real_up_sample: f64 = 0.5;
     let mut last_vol_ms: u64 = 0;
@@ -351,6 +353,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         if let Some(ref m) = market {
             if m.condition_id != user_ws_condition_id && !m.condition_id.is_empty() {
                 user_ws_condition_id = m.condition_id.clone();
+                pending_favorite = false; // nouvelle fenêtre → purge un éventuel flag favorite périmé
                 if let Some(ref tx) = user_ws_cond_tx {
                     let _ = tx.send(Some(m.condition_id.clone()));
                 }
@@ -689,7 +692,12 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             && remaining_s > 0
         {
             if let (Some(m), Some(bk), Some(engine)) = (&market, live_bankroll_val, engine_tx.as_ref()) {
-                let fav = if real_up >= cfg.favorite_price_min { Some((Side::Up, &m.up_token_id, &*up_book)) }
+                // ANTI-BOUCLE : une seule tentative d'entrée favorite par fenêtre. Sinon, après un
+                // catastrophe-sell (ou toute clôture), la position repasse Idle et on re-rentrerait
+                // aussitôt → boucle achat→vente (les ~25 positions observées). Le condition_id change
+                // au rollover → l'entrée se ré-autorise à la fenêtre suivante.
+                let fav = if m.condition_id == favorite_window_id { None }
+                    else if real_up >= cfg.favorite_price_min { Some((Side::Up, &m.up_token_id, &*up_book)) }
                     else if (1.0 - real_up) >= cfg.favorite_price_min { Some((Side::Down, &m.down_token_id, &*down_book)) }
                     else { None };
                 if let Some((side, token, book)) = fav {
@@ -703,6 +711,7 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             min_order_size: m.min_order_size, kind: OrderKind::Fak, reply: tx,
                         };
                         if engine.try_send(cmd).is_ok() {
+                            favorite_window_id = m.condition_id.clone(); // fenêtre consommée : plus de ré-entrée
                             pending_opens.push(PendingOpen { rx: rx_r, side, token_id: token.clone(),
                                 neg_risk: m.neg_risk, order_price, size, tick: m.tick_size, now_ms });
                             pending_favorite = true;
