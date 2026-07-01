@@ -106,6 +106,14 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         let decisiveness = (real_up - 0.5).abs();
                         let time_factor = ((300.0 - remaining_s as f64) / 300.0).clamp(0.0, 1.0);
                         let required_gap = cfg.gap_min + cfg.gap_dynamic_k * decisiveness * time_factor;
+                        // Spread du carnet du side visé : en taker on paie l'ask et on sort au bid,
+                        // un spread ≥ bande TP = trade pré-stoppé (perte du spread garantie à l'entrée).
+                        let sig_book = if side == Side::Up { &*up_book } else { &*down_book };
+                        let spread = match (sig_book.best_ask(), sig_book.best_bid()) {
+                            (Some(a), Some(b)) => a - b,
+                            _ => f64::INFINITY, // carnet incomplet → on s'abstient
+                        };
+                        let max_spread = cfg.spread_guard_k * cfg.take_profit_cents / 100.0;
                         let reject = if controls.is_breaker_tripped() { Some("breaker déclenché") }
                             else if controls.is_paper_paused() { Some("paper en pause") }
                             else if market.is_none() { Some("pas de marché") }
@@ -113,11 +121,13 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             else if real_up < cfg.price_min || real_up > cfg.price_max { Some("hors bande de prix (binaire trop décidé)") }
                             else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
                             else if gap < required_gap { Some("gap insuffisant") }
+                            else if cfg.spread_guard_k > 0.0 && spread >= max_spread { Some("spread trop large (pré-stoppé)") }
                             else { None };
                         if let Some(reason) = reject {
                             tracing::info!(reason, side = side.as_str(), fair = format!("{fair:.3}"),
                                 real = format!("{real_up:.3}"), gap = format!("{gap:+.3}"),
-                                req = format!("{required_gap:.3}"), "✗ signal rejeté (paper)");
+                                req = format!("{required_gap:.3}"), spread = format!("{spread:.3}"),
+                                max_spread = format!("{max_spread:.3}"), "✗ signal rejeté (paper)");
                         } else if let Some(m) = &market {
                             let (book, token) = if side == Side::Up {
                                 (&*up_book, &m.up_token_id)

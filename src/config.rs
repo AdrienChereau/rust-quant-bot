@@ -54,6 +54,10 @@ pub struct Config {
     pub take_profit_cents: f64,
     pub stop_loss_cents: f64,
     pub max_hold_secs: i64,
+    /// Garde-fou spread (paper) : on ne tire PAS si `(ask − bid) ≥ k · TP`. En taker on paie l'ask
+    /// et on sort au bid → un spread ≥ bande TP rend le trade pré-stoppé (perte du spread garantie).
+    /// k=0.5 par défaut ; 0 désactive le garde-fou.
+    pub spread_guard_k: f64,
 
     // Live testing (passage paper → réel)
     pub exec_mode: String,     // EXEC_MODE : "taker" (FAK, chemin actuel) | "maker" (GTC resting).
@@ -156,6 +160,7 @@ impl Config {
             take_profit_cents: env_or("TAKE_PROFIT_CENTS", 4.0),
             stop_loss_cents: env_or("STOP_LOSS_CENTS", 3.0),
             max_hold_secs: env_or("MAX_HOLD_SECS", 60),
+            spread_guard_k: env_or("SPREAD_GUARD_K", 0.5),
 
             exec_mode: env::var("EXEC_MODE").unwrap_or_else(|_| "taker".into()),
             maker_price_k_spread: env_or("MAKER_PRICE_K_SPREAD", 0.25),
