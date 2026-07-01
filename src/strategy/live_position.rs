@@ -67,6 +67,14 @@ pub struct LivePosition {
     /// Cumul de vente réalisé sur cette position. `size = bought - sold`.
     #[serde(default)]
     pub sold: f64,
+    /// Stratégie 2 « favorite fin de fenêtre » : on TIENT jusqu'à la résolution (le token gagnant
+    /// paie $1). La gestion ignore TP/SL/max_hold/force-exit ; seule la catastrophe vend.
+    #[serde(default)]
+    pub hold_to_resolution: bool,
+    /// Catastrophe armée (retournement détecté) : une fois `true`, reste `true` → re-vente forcée au
+    /// marché à chaque tick jusqu'au fill, même si le gap contraire reflue (pas de retour en hold).
+    #[serde(default)]
+    pub catastrophe_armed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +138,23 @@ impl LivePositionManager {
 
     /// Aucune position ni ordre en cours → on peut tirer un nouveau signal.
     pub fn is_idle(&self) -> bool { matches!(self.phase, LivePhase::Idle) }
+
+    /// Stratégie favorite : marque la position `Open` courante comme « tenue jusqu'à résolution »
+    /// (exemptée TP/SL/max_hold/force-exit ; seule la catastrophe la vend).
+    pub fn mark_hold_to_resolution(&mut self) {
+        if let LivePhase::Open(ref mut p) = self.phase {
+            p.hold_to_resolution = true;
+            self.persist();
+        }
+    }
+
+    /// Arme la catastrophe (retournement) : la position re-vendra au marché à chaque tick jusqu'au
+    /// fill, sans retour en hold. Idempotent.
+    pub fn arm_catastrophe(&mut self) {
+        if let LivePhase::Open(ref mut p) = self.phase {
+            if !p.catastrophe_armed { p.catastrophe_armed = true; self.persist(); }
+        }
+    }
 
     /// order_id du BUY qu'on suit (PendingBuy en attente OU Open déjà rempli) — pour réconcilier un
     /// fill WS quel que soit le champ (taker/maker) où Polymarket place notre id.
@@ -666,6 +691,7 @@ impl LivePositionManager {
             tp_price: tp, sl_price: sl, opened_ms: now_ms, neg_risk,
             buy_order_id: order_id.to_string(), tick,
             bought: filled, sold: 0.0,
+            hold_to_resolution: false, catastrophe_armed: false,
         };
         self.append("open", side.as_str(), entry, filled, 0.0, order_id);
         tracing::warn!(side = side.as_str(), token_id, entry = format!("{entry:.3}"),
@@ -998,6 +1024,27 @@ mod tests {
         let _ = m.on_sell_result(OrderResult::Failed { error: err.clone() }, "stop_loss", 60_000, 5.0);
         let _ = m.on_sell_result(OrderResult::Failed { error: err }, "stop_loss", 60_000, 5.0);
         assert!(m.is_idle(), "après 3 échecs settled (vrai 0), abandon contrôlé, got {:?}", m.phase);
+    }
+
+    #[test]
+    fn favorite_flags_default_false_and_settable() {
+        // Stratégie 2 : une position normale n'est ni hold_to_resolution ni catastrophe_armed.
+        // mark_hold_to_resolution / arm_catastrophe posent les flags sur la position Open courante.
+        let mut m = mgr_named("favorite_flags");
+        m.on_buy_result(
+            OrderResult::Placed { order_id: "f1".into(), filled_size: Some(5.0), avg_price: Some(0.85), post_ms: 50 },
+            Side::Up, "tok", false, 0.85, 5.0, 0.01, 1000,
+        );
+        match &m.phase {
+            LivePhase::Open(p) => { assert!(!p.hold_to_resolution); assert!(!p.catastrophe_armed); }
+            o => panic!("doit être Open, got {o:?}"),
+        }
+        m.mark_hold_to_resolution();
+        m.arm_catastrophe();
+        match &m.phase {
+            LivePhase::Open(p) => { assert!(p.hold_to_resolution, "hold posé"); assert!(p.catastrophe_armed, "catastrophe armée"); }
+            o => panic!("doit rester Open, got {o:?}"),
+        }
     }
 
     #[test]

@@ -166,6 +166,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     let mut last_status_poll_ms: u64 = 0; // dernier poll de statut d'ordre (PendingBuy)
     let mut last_sell_attempt_ms: u64 = 0; // throttle des re-tentatives de SELL (anti-spam 50 ms)
     let mut last_hist_ms: u64 = 0;         // dernier point poussé dans l'historique du chart (~1/s)
+    let mut pending_favorite = false;      // le prochain fill adopté est une entrée FAVORITE (→ hold_to_resolution)
+    let mut real_up_vol: f64 = 0.0;        // EWMA de |Δreal_up|/s : proxy de vol observé côté live (favorite)
+    let mut last_real_up_sample: f64 = 0.5;
+    let mut last_vol_ms: u64 = 0;
     // Token dont le cache d'allowance CONDITIONAL a déjà été rafraîchi pour la position courante.
     // Sans ce refresh, le CLOB voit 0 token outcome après le BUY → tout SELL est rejeté « balance 0 »
     // (on rentre mais on ne sort pas). On le fait UNE fois par position, dès l'adoption (hors hot-loop).
@@ -211,6 +215,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             // Bloque l'entrée dès qu'on est dans la zone de flatten forcé : ouvrir là
                             // = sortie forcée immédiate à perte. Cohérent avec le forced-exit (§2).
                             else if remaining_s <= cfg.end_window_block_secs.max(FORCE_EXIT_REMAINING_S) { Some("fin de fenêtre (flatten imminent)") }
+                            // Stratégie 2 : dans les 60 dernières secondes, le scalp se tait — la favorite prend la main.
+                            else if cfg.favorite_enabled && remaining_s <= cfg.favorite_liquidate_secs { Some("fenêtre favorite (scalp off)") }
                             else if real_up < cfg.price_min || real_up > cfg.price_max { Some("hors bande de prix (binaire trop décidé)") }
                             else if now_ms.saturating_sub(last_fire_ms) < cfg.cooldown_ms { Some("cooldown") }
                             else if gap < required_gap { Some("gap insuffisant") }
@@ -332,6 +338,15 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
             remaining_s = g.remaining_s;
         }
 
+        // Proxy de VOLATILITÉ observé côté live : EWMA de |Δreal_up| par seconde. Alimente le seuil de
+        // catastrophe de la favorite (haute vol = real_up gigote → seuil ↑ pour filtrer le bruit).
+        if now_ms.saturating_sub(last_vol_ms) >= 1000 {
+            last_vol_ms = now_ms;
+            let d = (real_up - last_real_up_sample).abs();
+            last_real_up_sample = real_up;
+            real_up_vol = 0.3 * d + 0.7 * real_up_vol; // EWMA (alpha 0.3, lissage ~3 s)
+        }
+
         // ── 0. Rollover user WS — notifie la task du nouveau condition_id ──────────────
         if let Some(ref m) = market {
             if m.condition_id != user_ws_condition_id && !m.condition_id.is_empty() {
@@ -448,6 +463,13 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                     // Nouvelle position → reset du throttle de sortie : le 1er exit (TP surtout) doit
                     // pouvoir partir SANS délai (le throttle exit_retry_ms ne concerne que les re-essais).
                     last_sell_attempt_ms = 0;
+                    // Stratégie 2 : si ce fill est une entrée favorite, on la marque « hold jusqu'à
+                    // résolution » (exemptée TP/SL/force-exit ; seule la catastrophe vend).
+                    if pending_favorite {
+                        live_mgr.mark_hold_to_resolution();
+                        pending_favorite = false;
+                        tracing::warn!(token_id = %tok, "✅ position FAVORITE adoptée — tenue jusqu'à résolution");
+                    }
                     if cfg.live_armed {
                         if let Some(creds) = live_creds.clone() {
                             tokio::spawn(async move {
@@ -565,6 +587,47 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                             "🪙 fenêtre tournée — position réglée à l'expiration (pas de TP sur le marché suivant)");
                         live_mgr.resolve_expired(last_pos_bid.unwrap_or(0.0));
                         last_pos_bid = None;
+                    } else if pos.hold_to_resolution {
+                        // ── FAVORITE : tenue jusqu'à la RÉSOLUTION (token gagnant = $1 auto au rollover).
+                        // Seule la CATASTROPHE (retournement du fair Tokyo) vend — en VENTE GARANTIE :
+                        // ordre de MARCHÉ, ré-émis à chaque tick jusqu'au fill, INDÉPENDAMMENT du bid
+                        // local. Une fois armée, on re-vend même si le gap contraire reflue. Sinon : rien.
+                        let book = if pos.side == Side::Up { &*up_book } else { &*down_book };
+                        if let Some(b) = book.best_bid() { last_pos_bid = Some(b); }
+                        let contrary = if pos.side == Side::Up { real_up - last_fair } else { last_fair - real_up };
+                        let frac = ((cfg.favorite_enter_secs - remaining_s).max(0) as f64
+                            / (cfg.favorite_enter_secs.max(1) as f64)).clamp(0.0, 1.0);
+                        // Durcissement TEMPS (base + k·frac) scalé par la VOL observée : haute vol →
+                        // seuil ↑ (filtre le bruit d'un real_up jumpy) ; basse vol → seuil ↓ (réactif).
+                        let vol_factor = if cfg.favorite_vol_ref > 0.0 {
+                            (real_up_vol / cfg.favorite_vol_ref).clamp(0.5, 2.5)
+                        } else { 1.0 };
+                        let cata_threshold =
+                            (cfg.favorite_catastrophe_base + cfg.favorite_catastrophe_k * frac) * vol_factor;
+                        if pos.catastrophe_armed || contrary > cata_threshold {
+                            if !pos.catastrophe_armed {
+                                tracing::warn!(side = pos.side.as_str(), real = format!("{real_up:.3}"),
+                                    fair = format!("{last_fair:.3}"), contrary = format!("{contrary:+.3}"),
+                                    seuil = format!("{cata_threshold:.3}"), vol = format!("{real_up_vol:.4}"),
+                                    vol_factor = format!("{vol_factor:.2}"), remaining_s,
+                                    "🚨 CATASTROPHE favorite — retournement détecté, vente garantie");
+                                live_mgr.arm_catastrophe();
+                            }
+                            if now_ms.saturating_sub(last_sell_attempt_ms) >= cfg.exit_retry_ms {
+                                last_sell_attempt_ms = now_ms;
+                                // Ordre de MARCHÉ (prix ignoré en live ; repli 0.01 si pas de bid local).
+                                let exit = last_pos_bid.map(|b| (b - cfg.exit_buffer).max(0.01)).unwrap_or(0.01);
+                                let (tx, rx_r) = oneshot::channel();
+                                let cmd = OrderCmd::Close {
+                                    token_id: pos.token_id.clone(), side: pos.side, neg_risk: pos.neg_risk,
+                                    price: exit, size: pos.size, tick: m.tick_size, kind: OrderKind::Fak, reply: tx,
+                                };
+                                if engine.try_send(cmd).is_ok() {
+                                    pending_close = Some((rx_r, "catastrophe"));
+                                    tracing::warn!(size = pos.size, "🚨 SELL CATASTROPHE soumis (marché, garanti)");
+                                }
+                            }
+                        }
                     } else {
                     let book = if pos.side == Side::Up { &*up_book } else { &*down_book };
                     if let Some(bid) = book.best_bid() {
@@ -576,6 +639,8 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         //      spread d'entrée). max_hold/fin de fenêtre = sortie forcée.
                         let reason = if bid >= pos.tp_price { Some("take_profit") }
                             else if held_ms >= cfg.min_hold_sl_ms && bid <= pos.sl_price { Some("stop_loss") }
+                            // Stratégie 2 : à T-60s on liquide le scalp pour laisser entrer la favorite.
+                            else if cfg.favorite_enabled && remaining_s <= cfg.favorite_liquidate_secs { Some("favorite_takeover") }
                             // Distinct de max_hold : la fenêtre se ferme, flatten forcé (≠ "détenu trop
                             // longtemps"). Évite l'étiquette trompeuse "max_hold" sur un fill instantané.
                             else if remaining_s <= FORCE_EXIT_REMAINING_S { Some("window_close") }
@@ -607,6 +672,48 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                         }
                     }
                     } // fin else (token de la position toujours actif)
+                }
+            }
+        }
+
+        // ── 2b. Entrée FAVORITE (stratégie 2, tick-driven, dernières secondes) ────────
+        // Quand on est à plat dans les T-favorite_enter_secs dernières secondes et qu'une issue est
+        // > favorite_price_min, on achète cette favorite (taker market) et on la TIENT jusqu'à la
+        // résolution. La liquidation d'un éventuel scalp s'est faite via "favorite_takeover" (§2).
+        if cfg.favorite_enabled
+            && controls.live_active()
+            && live_mgr.is_idle()
+            && pending_opens.is_empty()
+            && pending_close.is_none()
+            && remaining_s <= cfg.favorite_enter_secs
+            && remaining_s > 0
+        {
+            if let (Some(m), Some(bk), Some(engine)) = (&market, live_bankroll_val, engine_tx.as_ref()) {
+                let fav = if real_up >= cfg.favorite_price_min { Some((Side::Up, &m.up_token_id, &*up_book)) }
+                    else if (1.0 - real_up) >= cfg.favorite_price_min { Some((Side::Down, &m.down_token_id, &*down_book)) }
+                    else { None };
+                if let Some((side, token, book)) = fav {
+                    let order_price = (book.best_ask().unwrap_or(real_up) + cfg.entry_buffer).min(0.99);
+                    let size = m.min_order_size.max((cfg.notional_target_usd / order_price).ceil());
+                    if size * order_price <= bk {
+                        let (tx, rx_r) = oneshot::channel();
+                        let cmd = OrderCmd::Open {
+                            side, token_id: token.clone(), neg_risk: m.neg_risk,
+                            price: order_price, size, tick: m.tick_size,
+                            min_order_size: m.min_order_size, kind: OrderKind::Fak, reply: tx,
+                        };
+                        if engine.try_send(cmd).is_ok() {
+                            pending_opens.push(PendingOpen { rx: rx_r, side, token_id: token.clone(),
+                                neg_risk: m.neg_risk, order_price, size, tick: m.tick_size, now_ms });
+                            pending_favorite = true;
+                            last_fire_ms = now_ms;
+                            tracing::warn!(side = side.as_str(), price = order_price, size, remaining_s,
+                                "🎯 ENTRÉE FAVORITE (taker market) — tenue jusqu'à résolution");
+                        }
+                    } else {
+                        tracing::warn!(cost = format!("{:.2}", size * order_price), bankroll = format!("{bk:.2}"),
+                            "✗ favorite : bankroll insuffisante");
+                    }
                 }
             }
         }
