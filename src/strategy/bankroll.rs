@@ -69,6 +69,10 @@ pub struct PaperEngine {
     pub fixed_order_usd: f64,
     /// true : simule une entrée MAKER (fill au bid, capte le spread). false : taker (VWAP asks).
     pub maker: bool,
+    /// true : simule les coûts RÉELS du live taker (entrée ask, sortie bid, fees). Force taker.
+    pub realistic: bool,
+    /// Coeff de fee taker (Polymarket crypto = 0.07). fee/share = coeff·p·(1−p), appliquée aux 2 jambes.
+    pub fee_coeff: f64,
     params: KellyParams,
     state_path: String,
     trades_path: String,
@@ -91,7 +95,8 @@ impl PaperEngine {
             .and_then(|s| serde_json::from_str::<SniperState>(&s).ok())
             .unwrap_or(SniperState { cash: start_cash, start_cash, peak_equity: start_cash, ..Default::default() });
         tracing::info!(cash = state.cash, shots = state.shots, wins = state.wins, "État sniper chargé");
-        Self { state, position: None, fixed_order_usd: 0.0, maker: false, params, state_path, trades_path }
+        Self { state, position: None, fixed_order_usd: 0.0, maker: false, realistic: false, fee_coeff: 0.0,
+            params, state_path, trades_path }
     }
 
     pub fn equity(&self, mark: Option<f64>) -> f64 {
@@ -121,8 +126,11 @@ impl PaperEngine {
             return false; // un seul tir à la fois
         }
         let Some(best_ask) = book.best_ask() else { return false };
-        // Prix de référence d'entrée : bid en MAKER (on poste et on capte le spread), ask en taker.
-        let entry_ref = if self.maker { book.best_bid().unwrap_or(best_ask) } else { best_ask };
+        // Mode RÉALISTE : on force l'entrée TAKER (ask) même si maker=true — le « fill au bid garanti »
+        // est justement l'artefact qui gonfle le paper. On paie l'ask comme le live.
+        let taker_entry = self.realistic || !self.maker;
+        // Prix de référence d'entrée : bid en MAKER pur (capte le spread), ask sinon.
+        let entry_ref = if taker_entry { best_ask } else { book.best_bid().unwrap_or(best_ask) };
         // Notionnel fixe ($) si activé (tests/comparaison) — sinon sizing Kelly normal.
         let size = if self.fixed_order_usd > 0.0 {
             (self.fixed_order_usd / entry_ref).floor().max(min_size)
@@ -133,12 +141,11 @@ impl PaperEngine {
             self.state.blocked_size += 1;
             return false;
         }
-        // MAKER : fill au bid (hypothèse OPTIMISTE = fill garanti, pas de sélection adverse → borne
-        // haute du maker). TAKER : VWAP en parcourant les asks (paie le spread + slippage).
-        let (avg_price, filled) = if self.maker {
-            (entry_ref, size)
-        } else {
+        // TAKER : VWAP en parcourant les asks (paie le spread + slippage). MAKER pur : fill au bid.
+        let (avg_price, filled) = if taker_entry {
             vwap_buy(book, size)
+        } else {
+            (entry_ref, size)
         };
         if filled <= 0.0 {
             return false;
@@ -159,7 +166,7 @@ impl PaperEngine {
         // Log VÉRIFIABLE : en maker `entry == bid` (on a capté le spread) ; en taker `entry ≈ ask`.
         let best_bid = book.best_bid().unwrap_or(0.0);
         tracing::warn!(
-            mode = if self.maker { "MAKER" } else { "TAKER" },
+            mode = if !taker_entry { "MAKER" } else if self.realistic { "TAKER-RÉEL" } else { "TAKER" },
             side = side.as_str(),
             entry = format!("{:.3}", avg_price),
             bid = format!("{:.3}", best_bid),
@@ -179,11 +186,15 @@ impl PaperEngine {
         let (tp_price, sl_price, opened_ms) = (p.tp_price, p.sl_price, p.opened_ms);
         let held_s = (now_ms.saturating_sub(opened_ms) / 1000) as i64;
 
+        // RÉALISTE : on sort au BID courant (vente taker au marché), pas au prix TP/SL exact — le live
+        // vend dans le carnet, il ne touche jamais pile le TP. OPTIMISTE : sortie pile au TP/SL.
         if bid >= tp_price {
-            self.close_position(tp_price, "take_profit");
+            let exit = if self.realistic { bid } else { tp_price };
+            self.close_position(exit, "take_profit");
             true
         } else if bid <= sl_price {
-            self.close_position(sl_price, "stop_loss");
+            let exit = if self.realistic { bid } else { sl_price };
+            self.close_position(exit, "stop_loss");
             true
         } else if held_s >= self.params.max_hold_secs || remaining_s <= 30 {
             self.close_position(bid, "max_hold"); // liquidation au marché
@@ -196,8 +207,12 @@ impl PaperEngine {
     fn close_position(&mut self, exit_price: f64, reason: &str) {
         let Some(p) = self.position.take() else { return };
         let proceeds = exit_price * p.size;
-        self.state.cash += proceeds;
-        let pnl = proceeds - p.entry_price * p.size;
+        // Fees taker RÉELLES sur les 2 jambes (déduites ici ; le coût d'entrée l'a été à `fire`).
+        // fee/share = coeff·p·(1−p). Nulles en mode optimiste (fee_coeff appliqué seulement si realistic).
+        let fee = |px: f64| if self.realistic { self.fee_coeff * p.size * px * (1.0 - px) } else { 0.0 };
+        let fees = fee(p.entry_price) + fee(exit_price);
+        self.state.cash += proceeds - fees;
+        let pnl = proceeds - fees - p.entry_price * p.size;
         self.state.realized_pnl = self.state.cash - self.state.start_cash;
         if pnl >= 0.0 { self.state.wins += 1 } else { self.state.losses += 1 }
         let eq = self.state.cash;
@@ -371,6 +386,28 @@ mod tests {
         let closed = e.manage(Some(0.40), 1000, 200); // sous le SL (~0.42)
         assert!(closed);
         assert_eq!(e.state.losses, 1);
+    }
+
+    #[test]
+    fn realistic_paper_enters_at_ask_and_pays_fees() {
+        let mut e = engine();
+        e.realistic = true;
+        e.fee_coeff = 0.07;
+        e.maker = true; // même en maker, le mode réaliste FORCE l'entrée taker (ask)
+        let cash0 = e.state.cash;
+        assert!(e.fire(Side::Up, "tok", 0.10, &book(), 0.01, 5.0, 0));
+        // Entrée à l'ASK (0.50), pas au bid (0.49) : le « fill maker gratuit » est neutralisé.
+        let entry = e.position.as_ref().unwrap().entry_price;
+        assert!((entry - 0.50).abs() < 1e-9, "entrée taker à l'ask, got {entry}");
+        let size = e.position.as_ref().unwrap().size;
+        // TP à 0.60 ; le bid monte à 0.65 → clôture au BID (réaliste) avec fees sur les 2 jambes.
+        assert!(e.manage(Some(0.65), 1000, 200));
+        assert_eq!(e.state.wins, 1);
+        let net = e.state.cash - cash0;
+        let gross = (0.65 - 0.50) * size;
+        let fees = 0.07 * size * (0.50 * 0.50) + 0.07 * size * (0.65 * 0.35);
+        assert!((net - (gross - fees)).abs() < 1e-6, "net = brut − fees ; net={net}, brut={gross}, fees={fees}");
+        assert!(net < gross, "les fees rabotent bien le gain brut");
     }
 
     #[test]

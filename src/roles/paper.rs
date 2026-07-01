@@ -60,11 +60,16 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
     paper.maker = cfg.maker_mode;
+    paper.realistic = cfg.paper_realistic;
+    paper.fee_coeff = cfg.taker_fee_coeff;
     if cfg.fixed_order_usd > 0.0 {
         tracing::warn!(usd = cfg.fixed_order_usd, "⚠️ FIXED_ORDER_USD actif — Kelly ignoré (tests)");
     }
-    if cfg.maker_mode {
-        tracing::warn!("📐 MAKER_MODE actif — entrée simulée au bid (capte le spread, optimiste)");
+    if cfg.paper_realistic {
+        tracing::warn!(fee_coeff = cfg.taker_fee_coeff,
+            "💯 PAPER_REALISTIC actif — entrée ask + sortie bid + fees ×2 (comparable au live taker)");
+    } else if cfg.maker_mode {
+        tracing::warn!("📐 MAKER_MODE actif — entrée simulée au bid (capte le spread, OPTIMISTE, borne haute)");
     }
 
     let mut rx = udp::listen(listen_port).await?;

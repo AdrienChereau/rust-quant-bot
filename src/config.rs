@@ -78,6 +78,9 @@ pub struct Config {
                                    // à chaque tir (plancher = minimum d'échange). Tests/comparaison.
     pub maker_mode: bool,          // MAKER_MODE (paper) : simule une entrée maker (fill au bid) au lieu
                                    // de taker (VWAP des asks) → capte le spread. Optimiste (fill garanti).
+    pub paper_realistic: bool,     // PAPER_REALISTIC (paper) : simule les coûts RÉELS du live taker —
+                                   // entrée à l'ask (force taker, pas de fill maker gratuit), sortie au
+                                   // bid réel, fees 7 bps ×2 jambes. → paper comparable au live.
     pub exit_buffer: f64,          // EXIT_BUFFER : prix de REPLI pour les sorties sur les chemins NON
                                    // sig_type=3 (EIP-712). En live (POLY_1271) la vente est un VRAI
                                    // ordre de marché (le SDK lit le book serveur) → ce prix est ignoré.
@@ -167,6 +170,7 @@ impl Config {
             live_force_min_size: env_or("LIVE_FORCE_MIN_SIZE", false),
             fixed_order_usd: env_or("FIXED_ORDER_USD", 0.0),
             maker_mode: env_or("MAKER_MODE", false),
+            paper_realistic: env_or("PAPER_REALISTIC", true),
             exit_buffer: env_or("EXIT_BUFFER", 0.02),
             exit_retry_ms: env_or("EXIT_RETRY_MS", 150u64),
             sell_skip_balance_refresh: env_or("SELL_SKIP_BALANCE_REFRESH", false),

@@ -184,6 +184,8 @@ async fn run_mono(cfg: Config) -> anyhow::Result<()> {
     );
     paper.fixed_order_usd = cfg.fixed_order_usd;
     paper.maker = cfg.maker_mode;
+    paper.realistic = cfg.paper_realistic;
+    paper.fee_coeff = cfg.taker_fee_coeff;
     // Manager LIVE — symétrique au PaperEngine, persistance séparée.
     let mut live_mgr = LivePositionManager::load_or_init(
         kelly,
