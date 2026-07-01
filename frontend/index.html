@@ -59,7 +59,7 @@
     <div class="card chart-card">
       <h2>📈 Prix du token & niveaux — <span class="muted" id="chart-sub">Entry / TP / SL persistants</span></h2>
       <div id="live-chart"></div>
-      <p class="muted" style="margin:.4rem 0 0">Courbe = <b>mark du token de la position</b> (Up = real_up, Down = 1−real_up ; real_up quand on est à plat). Lignes pointillées : <span style="color:#cfcfcf">entrée</span> · <span style="color:#3ad29f">TP</span> · <span style="color:#ff5d5d">SL</span>. Échantillon 1 s, ~1 h d'historique. (Le nœud live n'a pas le prix BTC — il faudrait le piper depuis le radar.)</p>
+      <p class="muted" style="margin:.4rem 0 0">Courbe = <b>real_up</b> (proba UP), lisse — plus de saut. Lignes : <span style="color:#dfe4ea">entrée</span> · <span style="color:#3ad29f">TP</span> · <span style="color:#ff5d5d">SL</span>, converties dans l'espace real_up. Pour un pari <b>DOWN</b> : TP en <b>bas</b> (gagne si real_up baisse), SL en <b>haut</b> (perd si real_up monte). Échantillon 1 s, ~1 h. (Pas de prix BTC côté live.)</p>
     </div>
 
     <div class="grid">

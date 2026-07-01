@@ -305,6 +305,10 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
                                                         tick: m.tick_size, now_ms,
                                                     });
                                                     buy_poll_done = false; // nouveau BUY → re-arme le poll de statut
+                                                    // Ce BUY est un SCALP : purge tout flag favorite périmé
+                                                    // (sinon un pending_favorite resté true marquerait ce scalp
+                                                    // comme « hold jusqu'à résolution » → tenu à mort).
+                                                    pending_favorite = false;
                                                     last_fire_ms = now_ms;
                                                     last_transport_ms = Some(transport_ms);
                                                     last_decide_ms = Some(recv_instant.elapsed().as_millis() as u64);
@@ -787,10 +791,14 @@ pub async fn run(cfg: Config, listen_port: u16) -> anyhow::Result<()> {
         // sinon real_up. Les niveaux entry/tp/sl sont dans le même espace → lignes alignées.
         if now_ms.saturating_sub(last_hist_ms) >= 1000 {
             last_hist_ms = now_ms;
+            // Courbe = TOUJOURS real_up (proba UP) → lisse, plus de saut au changement de sens. Les
+            // niveaux entry/tp/sl (en espace token de la position) sont convertis en espace real_up :
+            // pour un DOWN, real_up = 1 − prix_token → on trace 1 − niveau. Ainsi tout est aligné sur
+            // la même courbe (pour un down : TP en bas = « gagne si real_up baisse », SL en haut).
             let (p, entry, tp, sl) = match live_mgr.position() {
                 Some(pos) => {
-                    let mark = if pos.side == Side::Up { real_up } else { 1.0 - real_up };
-                    (mark, Some(pos.entry_price), Some(pos.tp_price), Some(pos.sl_price))
+                    let conv = |x: f64| if pos.side == Side::Up { x } else { 1.0 - x };
+                    (real_up, Some(conv(pos.entry_price)), Some(conv(pos.tp_price)), Some(conv(pos.sl_price)))
                 }
                 None => (real_up, None, None, None),
             };

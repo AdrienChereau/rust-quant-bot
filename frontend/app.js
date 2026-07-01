@@ -263,9 +263,11 @@ function updatePositionLines(s) {
   const ensure = (pl, price, color, title) =>
     pl ? (pl.applyOptions({ price, color, title }), pl)
        : _sPrice.createPriceLine({ price, color, lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title });
-  _plTp    = ensure(_plTp,    s.pos_tp,    "#3ad29f", "TP");
-  _plEntry = ensure(_plEntry, s.pos_entry, "#dfe4ea", "ENTRÉE");
-  _plSl    = ensure(_plSl,    s.pos_sl,    "#ff5d5d", "SL");
+  // La courbe est en espace real_up → on convertit les niveaux d'un pari DOWN (real_up = 1 − prix).
+  const conv = (x) => (s.pos_side === "down" ? 1 - x : x);
+  _plTp    = ensure(_plTp,    conv(s.pos_tp),    "#3ad29f", "TP");
+  _plEntry = ensure(_plEntry, conv(s.pos_entry), "#dfe4ea", "ENTRÉE");
+  _plSl    = ensure(_plSl,    conv(s.pos_sl),    "#ff5d5d", "SL");
   if (sub) {
     const side = (s.pos_side || "").toUpperCase();
     sub.textContent = `${side} @ ${fmt(s.pos_entry, 3)}  ·  TP ${fmt(s.pos_tp, 2)}  ·  SL ${fmt(s.pos_sl, 2)}`;
